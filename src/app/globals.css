@@ -1,0 +1,96 @@
+@import "tailwindcss";
+
+:root {
+  --background: #fff7fb;
+  --foreground: #4a3b52;
+}
+
+@theme {
+  --color-cream: #fff7fb;
+  --color-pink: #ff8fb1;
+  --color-pink-light: #ffe1ec;
+  --color-lavender: #b8a5ff;
+  --color-lavender-light: #ece5ff;
+  --color-mint: #7fe0c0;
+  --color-mint-light: #dcfbf1;
+  --color-butter: #ffd88a;
+  --color-butter-light: #fff3d6;
+  --color-ink: #4a3b52;
+  --color-ink-soft: #8b7d95;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-body);
+  --font-display: var(--font-display);
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-body), "Noto Sans KR", sans-serif;
+  background-image: radial-gradient(circle at 15% 0%, var(--color-lavender-light) 0%, transparent 45%),
+    radial-gradient(circle at 100% 20%, var(--color-mint-light) 0%, transparent 40%);
+  background-attachment: fixed;
+}
+
+.font-display {
+  font-family: var(--font-display), "Baloo 2", sans-serif;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-pink-light);
+  border-radius: 999px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* 애니메이션 */
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes zoom-in-95 {
+  from {
+    opacity: 0;
+    transform: scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes slide-in-top {
+  from {
+    transform: translateY(-10px);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+.animate-in {
+  animation: fade-in 0.3s ease-out;
+}
+
+.fade-in {
+  animation: fade-in 0.3s ease-out;
+}
+
+.zoom-in-95 {
+  animation: zoom-in-95 0.3s ease-out;
+}

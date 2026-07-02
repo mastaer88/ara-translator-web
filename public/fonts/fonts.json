@@ -1,0 +1,18 @@
+﻿{
+  "fonts": [
+    {
+      "id": "sans-serif",
+      "name": "기본 폰트",
+      "category": "sans-serif",
+      "file": null,
+      "preview": "깔끔하고 현대적인 폰트입니다"
+    },
+    {
+      "id": "serif",
+      "name": "세리프 폰트",
+      "category": "serif",
+      "file": null,
+      "preview": "전통적이고 우아한 폰트입니다"
+    }
+  ]
+}
