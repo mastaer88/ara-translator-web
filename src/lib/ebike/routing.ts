@@ -6,12 +6,13 @@ import { cumulativeDistances, haversine, projectOnRoute, type LatLng } from "./g
  * - trekking: 자전거도로 선호 + 거리 균형
  * - fastbike: 빠른 도로 위주 (차도 포함)
  */
-export type RouteProfile = "safety" | "trekking" | "fastbike";
+export type RouteProfile = "safety" | "trekking" | "fastbike" | "kakao";
 
 export const PROFILE_LABELS: Record<RouteProfile, { name: string; desc: string }> = {
   safety: { name: "자전거도로 우선", desc: "자전거 전용·겸용도로를 최대한 이용" },
   trekking: { name: "균형", desc: "자전거도로 선호 + 거리 고려" },
   fastbike: { name: "빠른 길", desc: "최단 시간 위주, 차도 포함" },
+  kakao: { name: "카카오 자전거", desc: "카카오맵 자전거 길찾기 · 한국어 안내 문구 (카카오 키 필요)" },
 };
 
 export type TurnType =
@@ -44,8 +45,14 @@ export type Route = {
   /** 자전거 전용/겸용 도로 비율 (0~1), 알 수 없으면 null */
   cyclewayRatio: number | null;
   maneuvers: Maneuver[];
-  source: "brouter" | "osrm";
+  source: "brouter" | "osrm" | "kakao";
   profile: RouteProfile;
+  /** 걷기 경로 (주차 위치로 걸어가기 등) */
+  walk?: boolean;
+  /** 카카오맵 앱·웹에서 같은 경로 보기 */
+  landingUrl?: string | null;
+  /** 요청한 방식 대신 다른 방식으로 찾은 경우 안내 */
+  note?: string;
 };
 
 export type Place = { name: string; detail: string; location: LatLng; distance?: number | null };
@@ -111,9 +118,9 @@ async function kakaoPlace<T>(params: Record<string, string>): Promise<T | null> 
 }
 
 export async function searchPlaces(query: string, near?: LatLng | null): Promise<Place[]> {
-  const kakao = await kakaoPlace<{ places: { name: string; detail: string; lat: number; lng: number; distance: number | null }[] }>(
-    { q: query, ...(near ? { lat: String(near.lat), lng: String(near.lng) } : {}) },
-  );
+  const kakao = await kakaoPlace<{
+    places: { name: string; detail: string; lat: number; lng: number; distance: number | null }[];
+  }>({ q: query, ...(near ? { lat: String(near.lat), lng: String(near.lng) } : {}) });
   if (kakao) {
     return kakao.places.map((p) => ({
       name: p.name,
@@ -137,9 +144,7 @@ async function searchNominatim(query: string, near?: LatLng | null): Promise<Pla
     const d = 0.3;
     params.set("viewbox", `${near.lng - d},${near.lat + d},${near.lng + d},${near.lat - d}`);
   }
-  const data = (await fetchJson(
-    `https://nominatim.openstreetmap.org/search?${params}`,
-  )) as NominatimItem[];
+  const data = (await fetchJson(`https://nominatim.openstreetmap.org/search?${params}`)) as NominatimItem[];
   return data.map((item) => {
     const parts = item.display_name.split(",").map((s) => s.trim());
     return {
@@ -151,7 +156,11 @@ async function searchNominatim(query: string, near?: LatLng | null): Promise<Pla
 }
 
 export async function reverseGeocode(p: LatLng): Promise<string> {
-  const kakao = await kakaoPlace<{ name: string | null }>({ lat: String(p.lat), lng: String(p.lng), reverse: "1" });
+  const kakao = await kakaoPlace<{ name: string | null }>({
+    lat: String(p.lat),
+    lng: String(p.lng),
+    reverse: "1",
+  });
   if (kakao?.name) return kakao.name;
   try {
     const params = new URLSearchParams({
@@ -161,9 +170,7 @@ export async function reverseGeocode(p: LatLng): Promise<string> {
       zoom: "17",
       "accept-language": "ko",
     });
-    const data = (await fetchJson(
-      `https://nominatim.openstreetmap.org/reverse?${params}`,
-    )) as NominatimItem;
+    const data = (await fetchJson(`https://nominatim.openstreetmap.org/reverse?${params}`)) as NominatimItem;
     return data.name || data.display_name.split(",")[0] || "선택한 위치";
   } catch {
     return "선택한 위치";
@@ -203,7 +210,8 @@ type BRouterGeoJson = {
   }[];
 };
 
-const CYCLE_TAG = /highway=cycleway|bicycle=designated|cycleway(:\w+)?=(lane|track|shared_lane)|route_bicycle_/;
+const CYCLE_TAG =
+  /highway=cycleway|bicycle=designated|cycleway(:\w+)?=(lane|track|shared_lane)|route_bicycle_/;
 
 function cyclewayRatioFromMessages(messages?: string[][]): number | null {
   if (!messages || messages.length < 2) return null;
@@ -222,9 +230,10 @@ function cyclewayRatioFromMessages(messages?: string[][]): number | null {
 }
 
 async function routeWithBRouter(from: LatLng, to: LatLng, profile: RouteProfile): Promise<Route> {
+  const brouterProfile = profile === "kakao" ? "safety" : profile;
   const params = new URLSearchParams({
     lonlats: `${from.lng},${from.lat}|${to.lng},${to.lat}`,
-    profile,
+    profile: brouterProfile,
     alternativeidx: "0",
     format: "geojson",
     timode: "3",
@@ -296,9 +305,11 @@ function osrmTurn(type: string, modifier?: string): TurnType | null {
   }
 }
 
-async function routeWithOsrm(from: LatLng, to: LatLng, profile: RouteProfile): Promise<Route> {
+async function routeWithOsrm(from: LatLng, to: LatLng, profile: RouteProfile, walk = false): Promise<Route> {
   const url =
-    `https://routing.openstreetmap.de/routed-bike/route/v1/bike/` +
+    (walk
+      ? `https://routing.openstreetmap.de/routed-foot/route/v1/foot/`
+      : `https://routing.openstreetmap.de/routed-bike/route/v1/bike/`) +
     `${from.lng},${from.lat};${to.lng},${to.lat}?overview=full&geometries=geojson&steps=true`;
   const data = (await fetchJson(url)) as OsrmResponse;
   const r = data.routes?.[0];
@@ -326,6 +337,76 @@ async function routeWithOsrm(from: LatLng, to: LatLng, profile: RouteProfile): P
     maneuvers,
     source: "osrm",
     profile,
+    walk,
+  });
+}
+
+// ───────────────────────── 카카오맵 길찾기 (자전거·도보) ─────────────────────────
+
+type KakaoRouteResponse = {
+  coords: [number, number][];
+  distance: number;
+  duration: number;
+  steps: { x: number; y: number; guidance: string; distance: number }[];
+  landingUrl: string | null;
+};
+
+/** 카카오 안내 문구 → 회전 종류 (회전·횡단 안내가 아니면 null) */
+export function guidanceToTurn(text: string): TurnType | null {
+  if (/도착/.test(text)) return null;
+  if (/유턴/.test(text)) return "uturn";
+  if (/회전교차로/.test(text)) return "roundabout";
+  if (/급\s*좌/.test(text)) return "sharp-left";
+  if (/급\s*우/.test(text)) return "sharp-right";
+  if (/좌회전/.test(text)) return "left";
+  if (/우회전/.test(text)) return "right";
+  if (/(왼쪽|좌측)/.test(text)) return "slight-left";
+  if (/(오른쪽|우측)/.test(text)) return "slight-right";
+  if (/(횡단보도|육교|지하도|계단)/.test(text)) return "straight";
+  return null;
+}
+
+async function routeWithKakao(
+  from: LatLng,
+  to: LatLng,
+  profile: RouteProfile,
+  walk: boolean,
+): Promise<Route> {
+  const params = new URLSearchParams({
+    mode: walk ? "walk" : "bicycle",
+    from: `${from.lat},${from.lng}`,
+    to: `${to.lat},${to.lng}`,
+  });
+  const res = await fetch(`/api/ebike/route?${params}`);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error ?? `카카오 길찾기 오류 (${res.status})`);
+  const r = data as KakaoRouteResponse;
+
+  const coords = r.coords.map(([lng, lat]) => ({ lat, lng }));
+  const cum = cumulativeDistances(coords);
+  const maneuvers: Maneuver[] = [];
+  for (const step of r.steps) {
+    const type = guidanceToTurn(step.guidance);
+    if (!type) continue;
+    const location = { lat: step.y, lng: step.x };
+    maneuvers.push({
+      distAlong: projectOnRoute(location, coords, cum).distAlong,
+      type,
+      // 카카오 문구가 너무 길면 기본 문구 사용
+      text: step.guidance.length <= 30 ? step.guidance : turnText(type),
+      location,
+    });
+  }
+  return finalizeRoute({
+    coords,
+    cum,
+    distance: cum[cum.length - 1] ?? r.distance,
+    cyclewayRatio: null,
+    maneuvers,
+    source: "kakao",
+    profile,
+    walk,
+    landingUrl: r.landingUrl,
   });
 }
 
@@ -342,9 +423,22 @@ function finalizeRoute(route: Route): Route {
   return { ...route, maneuvers: merged };
 }
 
-/** 자전거 경로 탐색. BRouter 실패 시 OSRM 자전거 프로필로 대체 */
+/**
+ * 자전거 경로 탐색.
+ * - "카카오 자전거": 카카오맵 → 실패하면 BRouter(자전거도로 우선)
+ * - 나머지: BRouter → 실패하면 OSRM 자전거
+ */
 export async function findBikeRoute(from: LatLng, to: LatLng, profile: RouteProfile): Promise<Route> {
   if (haversine(from, to) < 20) throw new Error("출발지와 목적지가 너무 가깝습니다");
+  if (profile === "kakao") {
+    try {
+      return await routeWithKakao(from, to, profile, false);
+    } catch (err) {
+      console.warn("카카오 자전거 길찾기 실패, BRouter로 대체", err);
+      const r = await routeWithBRouter(from, to, "safety").catch(() => routeWithOsrm(from, to, profile));
+      return { ...r, profile, note: "카카오 길찾기를 쓸 수 없어 자전거도로 우선 경로로 찾았습니다" };
+    }
+  }
   try {
     return await routeWithBRouter(from, to, profile);
   } catch (err) {
@@ -353,9 +447,62 @@ export async function findBikeRoute(from: LatLng, to: LatLng, profile: RouteProf
   }
 }
 
+/** 걷기 경로 (주차 위치로 걸어가기): 카카오 도보 → 실패하면 OSRM 도보 */
+export async function findWalkRoute(from: LatLng, to: LatLng): Promise<Route> {
+  if (haversine(from, to) < 15) throw new Error("이미 가까이 있습니다");
+  try {
+    return await routeWithKakao(from, to, "kakao", true);
+  } catch (err) {
+    console.warn("카카오 도보 길찾기 실패, OSRM 도보로 대체", err);
+    return await routeWithOsrm(from, to, "kakao", true);
+  }
+}
+
+// ───────────────────────── 주변 찾기 (카카오 카테고리·키워드) ─────────────────────────
+
+export type NearbyKind = { id: string; icon: string; label: string; category?: string; keyword?: string };
+
+export const NEARBY_KINDS: NearbyKind[] = [
+  { id: "CS2", icon: "🏪", label: "편의점", category: "CS2" },
+  { id: "toilet", icon: "🚻", label: "화장실", keyword: "공중화장실" },
+  { id: "repair", icon: "🔧", label: "자전거 수리", keyword: "자전거 수리" },
+  { id: "CE7", icon: "☕", label: "카페", category: "CE7" },
+  { id: "FD6", icon: "🍚", label: "음식점", category: "FD6" },
+  { id: "SW8", icon: "🚇", label: "지하철역", category: "SW8" },
+  { id: "PM9", icon: "💊", label: "약국", category: "PM9" },
+  { id: "HP8", icon: "🏥", label: "병원", category: "HP8" },
+];
+
+/** 주변 장소 (가까운 순). 카카오 키가 없으면 null */
+export async function searchNearby(kind: NearbyKind, near: LatLng): Promise<Place[] | null> {
+  const params: Record<string, string> = { lat: String(near.lat), lng: String(near.lng) };
+  if (kind.category) params.category = kind.category;
+  else {
+    params.q = kind.keyword ?? kind.label;
+    params.nearby = "1";
+  }
+  const data = await kakaoPlace<{
+    places: { name: string; detail: string; lat: number; lng: number; distance: number | null }[];
+  }>(params);
+  if (!data) return null;
+  return data.places.map((p) => ({
+    name: p.name,
+    detail: p.detail,
+    location: { lat: p.lat, lng: p.lng },
+    distance: p.distance,
+  }));
+}
+
+/** 카카오 기능(검색·길찾기)을 쓸 수 있는지 (한 번이라도 503을 받았으면 false) */
+export const kakaoEnabled = () => kakaoAvailable !== false;
+
 /** 좌표의 전체 주소 (위치 정보 조회용) */
 export async function addressOf(p: LatLng): Promise<string | null> {
-  const kakao = await kakaoPlace<{ address: string | null }>({ lat: String(p.lat), lng: String(p.lng), reverse: "1" });
+  const kakao = await kakaoPlace<{ address: string | null }>({
+    lat: String(p.lat),
+    lng: String(p.lng),
+    reverse: "1",
+  });
   if (kakao?.address) return kakao.address;
   try {
     const params = new URLSearchParams({
@@ -365,9 +512,7 @@ export async function addressOf(p: LatLng): Promise<string | null> {
       zoom: "18",
       "accept-language": "ko",
     });
-    const data = (await fetchJson(
-      `https://nominatim.openstreetmap.org/reverse?${params}`,
-    )) as NominatimItem;
+    const data = (await fetchJson(`https://nominatim.openstreetmap.org/reverse?${params}`)) as NominatimItem;
     // Nominatim은 "번지, 도로, 동, 구, 시, 우편번호, 국가" 순서 → 한국식으로 뒤집음
     const parts = data.display_name
       .split(",")

@@ -14,8 +14,12 @@ import {
   type LatLng,
 } from "@/lib/ebike/geo";
 import {
+  NEARBY_KINDS,
   PROFILE_LABELS,
   findBikeRoute,
+  findWalkRoute,
+  searchNearby,
+  type NearbyKind,
   reverseGeocode,
   searchPlaces,
   type Maneuver,
@@ -80,7 +84,11 @@ const MapView = dynamic(() => import("./MapView"), { ssr: false });
 
 type RideStatus = "idle" | "riding" | "paused";
 type GpsStatus = "off" | "waiting" | "on" | "error";
-type Destination = { name: string; location: LatLng };
+/** walk: 걸어서 가는 목적지 (주차 위치로 돌아가기 등) */
+type Destination = { name: string; location: LatLng; walk?: boolean };
+
+/** 걷기 안내의 기본 속도 (km/h) */
+const WALK_KMH = 4.5;
 type EtaBasis = "current" | "average" | "setting";
 type NavProgress = {
   remaining: number;
@@ -274,7 +282,10 @@ export default function EbikeApp() {
       }
       setRouting(true);
       try {
-        const r = await findBikeRoute(origin, dest.location, profile ?? settingsRef.current.profile);
+        const r = dest.walk
+          ? await findWalkRoute(origin, dest.location)
+          : await findBikeRoute(origin, dest.location, profile ?? settingsRef.current.profile);
+        if (r.note) toast.info(r.note);
         navRef.current.route = r;
         navRef.current.announced = new Map();
         navRef.current.offCount = 0;
@@ -327,7 +338,7 @@ export default function EbikeApp() {
       kmh = smooth;
       basis = "average";
     } else {
-      kmh = settingsRef.current.cruiseSpeed;
+      kmh = navRef.current.route?.walk ? WALK_KMH : settingsRef.current.cruiseSpeed;
       basis = "setting";
     }
     const etaSec = remaining / (kmh / 3.6);
@@ -397,7 +408,7 @@ export default function EbikeApp() {
         say(`잠시 후 ${next.text}`, true);
       } else if (distToNext <= 250 && distToNext > 90 && !stages.has("far")) {
         stages.add("far").add("straight");
-        say(`${spokenDistance(distToNext)} 앞에서 ${next.text}`);
+        say(aheadPhrase(distToNext, next.text));
       } else if (distToNext > 400 && !stages.has("straight")) {
         // 회전 직후 다음 안내까지 멀면 직진 거리를 알려줌
         stages.add("straight");
@@ -436,7 +447,8 @@ export default function EbikeApp() {
       setSpeed((prev) => (kmh === 0 ? 0 : prev * 0.3 + kmh * 0.7));
       setPosition(p);
       setAccuracy(acc);
-      if (rawHeading !== null && !Number.isNaN(rawHeading) && rawHeading >= 0 && kmh > 3) setHeading(rawHeading);
+      if (rawHeading !== null && !Number.isNaN(rawHeading) && rawHeading >= 0 && kmh > 3)
+        setHeading(rawHeading);
       // 방향 정보가 없으면 직전 위치에서 이동한 방향으로 계산
       else if (last && step >= 5 && kmh > 3) setHeading(bearing(last.p, p));
       positionRef.current = p;
@@ -788,6 +800,31 @@ export default function EbikeApp() {
     }
   };
 
+  // ───────────── 주변 찾기 (카카오) ─────────────
+  const [nearbyKind, setNearbyKind] = useState<string | null>(null);
+  const findNearby = async (kind: NearbyKind) => {
+    const near = positionRef.current ?? (await getCurrentPosition().catch(() => null));
+    if (!near) {
+      toast.error("현재 위치를 알 수 없습니다.");
+      return;
+    }
+    setSearching(true);
+    setNearbyKind(kind.id);
+    try {
+      const list = await searchNearby(kind, near);
+      if (list === null) {
+        toast.info("주변 찾기는 카카오 키가 설정되어야 쓸 수 있습니다.");
+        return;
+      }
+      setResults(list);
+      if (list.length === 0) toast.info(`근처에 ${kind.label}이(가) 없습니다.`);
+    } catch {
+      toast.error("주변 찾기에 실패했습니다.");
+    } finally {
+      setSearching(false);
+    }
+  };
+
   const chooseDestination = async (dest: Destination) => {
     stopNavigation();
     setDestination(dest);
@@ -874,7 +911,8 @@ export default function EbikeApp() {
     const pk = parkingData.parking;
     if (!pk) return;
     setSheet("nav");
-    chooseDestination({ name: "주차 위치", location: { lat: pk.lat, lng: pk.lng } });
+    // 자전거를 찾으러 가는 길이므로 걷기 경로
+    chooseDestination({ name: "주차 위치", location: { lat: pk.lat, lng: pk.lng }, walk: true });
   };
 
   const showParking = () => {
@@ -939,12 +977,17 @@ export default function EbikeApp() {
       : recentAvg !== null && recentAvg > MOVING_KMH
         ? { kmh: recentAvg, label: `최근 주행 평균 ${recentAvg.toFixed(1)}km/h 기준` }
         : { kmh: settings.cruiseSpeed, label: `기본 속도 ${settings.cruiseSpeed}km/h 기준` };
-  const planEtaSec = route ? route.distance / (plan.kmh / 3.6) : 0;
+  const walkPlan = route?.walk ? { kmh: WALK_KMH, label: `걷는 속도 ${WALK_KMH}km/h 기준` } : null;
+  const planEtaSec = route ? route.distance / ((walkPlan ?? plan).kmh / 3.6) : 0;
 
   const startNavigation = () => {
     if (!route || !destination) return;
     unlockSpeech();
-    if (rideStatus !== "riding") startRide();
+    if (destination.walk) {
+      // 걸어가는 길은 주행 기록 없이 위치만 추적
+      startGps();
+      acquireWakeLock();
+    } else if (rideStatus !== "riding") startRide();
     navRef.current.navigating = true;
     navRef.current.announced = new Map();
     setNavigating(true);
@@ -958,7 +1001,8 @@ export default function EbikeApp() {
     }
     if (s.navVoice) {
       say(
-        `${destination.name}까지 길 안내를 시작합니다. 총 ${spokenDistance(route.distance)}${ratio}, ` +
+        `${destination.name}까지 ${destination.walk ? "걸어서 " : ""}길 안내를 시작합니다. ` +
+          `총 ${spokenDistance(route.distance)}${ratio}, ` +
           `약 ${formatEta(planEtaSec)} 걸립니다.`,
       );
       if (routeBatteryLeft !== null && routeBatteryLeft < 10)
@@ -979,7 +1023,7 @@ export default function EbikeApp() {
       say(`목적지까지 ${spokenDistance(distToNext)} 남았습니다. ${eta}`, true);
     } else {
       say(
-        `${spokenDistance(distToNext)} 앞에서 ${next.text}. 목적지까지 ${spokenDistance(progress.remaining)}, ${eta}`,
+        `${aheadPhrase(distToNext, next.text)}. 목적지까지 ${spokenDistance(progress.remaining)}, ${eta}`,
         true,
       );
     }
@@ -1338,6 +1382,21 @@ export default function EbikeApp() {
             📍 지도에서 목적지 선택
           </button>
 
+          <div className="mt-3 text-xs text-slate-400">주변 찾기 (가까운 순)</div>
+          <div className="mt-1 flex gap-2 overflow-x-auto pb-1">
+            {NEARBY_KINDS.map((k) => (
+              <button
+                key={k.id}
+                onClick={() => findNearby(k)}
+                className={`shrink-0 rounded-full px-3 py-1.5 text-sm ${
+                  nearbyKind === k.id && results.length > 0 ? "bg-blue-700" : "bg-slate-800"
+                }`}
+              >
+                {k.icon} {k.label}
+              </button>
+            ))}
+          </div>
+
           <div className="mt-3 flex gap-2 overflow-x-auto pb-1">
             <button
               onClick={() => goToPlace(places.home, "집")}
@@ -1386,7 +1445,9 @@ export default function EbikeApp() {
                     <div className="font-medium">{r.name}</div>
                     <div className="truncate text-xs text-slate-400">
                       {r.detail}
-                      {position && ` · 직선 ${formatDistance(haversine(position, r.location))}`}
+                      {r.distance != null
+                        ? ` · ${formatDistance(r.distance)}`
+                        : position && ` · 직선 ${formatDistance(haversine(position, r.location))}`}
                     </div>
                   </button>
                 </li>
@@ -1394,8 +1455,10 @@ export default function EbikeApp() {
             </ul>
           )}
 
-          <div className="mt-4 text-sm text-slate-400">경로 옵션</div>
-          <div className="mt-1 grid grid-cols-3 gap-2">
+          <div className="mt-4 text-sm text-slate-400">
+            경로 옵션{destination?.walk && " · 🚶 주차 위치까지는 걷기 경로로 안내합니다"}
+          </div>
+          <div className="mt-1 grid grid-cols-2 gap-2">
             {(Object.keys(PROFILE_LABELS) as RouteProfile[]).map((p) => (
               <button
                 key={p}
@@ -1444,11 +1507,26 @@ export default function EbikeApp() {
                     />
                   </div>
                   <div className="mt-1 text-[11px] text-slate-500">
-                    {route.source === "brouter" ? "BRouter" : "OSRM 자전거"} 경로 · 예상 시간은 {plan.label},
-                    안내 중에는 현재 속도로 실시간 계산
+                    {route.walk ? "🚶 걷기 · " : ""}
+                    {route.source === "kakao"
+                      ? "카카오맵"
+                      : route.source === "brouter"
+                        ? "BRouter"
+                        : "OSRM"}{" "}
+                    경로 · 예상 시간은 {(walkPlan ?? plan).label}, 안내 중에는 현재 속도로 실시간 계산
                   </div>
+                  {route.landingUrl && (
+                    <a
+                      href={route.landingUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="mt-1 inline-block text-xs text-yellow-300 underline"
+                    >
+                      카카오맵에서 이 경로 열기 ↗
+                    </a>
+                  )}
                   <ul className="mt-2 space-y-1 text-xs">
-                    {routeBatteryLeft !== null && (
+                    {routeBatteryLeft !== null && !route.walk && (
                       <li className={routeBatteryLeft < 10 ? "text-red-300" : "text-slate-300"}>
                         🔋 도착 시 예상 배터리 {Math.max(0, Math.round(routeBatteryLeft))}%
                         {routeBatteryLeft < 10 && " — 부족할 수 있어요"}
@@ -1832,6 +1910,11 @@ function MenuItem({
       {value && <span className="text-xs text-emerald-400">{value}</span>}
     </button>
   );
+}
+
+/** "250미터 앞에서 좌회전" / 카카오 문구에 이미 "~에서"가 있으면 "250미터 앞, 잠실사거리에서 좌회전" */
+function aheadPhrase(dist: number, text: string): string {
+  return /에서/.test(text) ? `${spokenDistance(dist)} 앞, ${text}` : `${spokenDistance(dist)} 앞에서 ${text}`;
 }
 
 function formatClock(ts: number): string {
