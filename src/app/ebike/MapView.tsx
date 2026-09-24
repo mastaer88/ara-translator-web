@@ -12,6 +12,8 @@ type Props = {
   accuracy: number | null;
   route: Route | null;
   destination: LatLng | null;
+  /** 기록 보기: 지난 주행 경로 */
+  track: LatLng[] | null;
   follow: boolean;
   cycleLayer: boolean;
   pickMode: boolean;
@@ -35,7 +37,7 @@ function positionIcon(L: typeof Leaflet, heading: number | null) {
 }
 
 export default function MapView(props: Props) {
-  const { position, heading, accuracy, route, destination, follow, cycleLayer } = props;
+  const { position, heading, accuracy, route, destination, track, follow, cycleLayer } = props;
   const containerRef = useRef<HTMLDivElement>(null);
   const LRef = useRef<typeof Leaflet | null>(null);
   const mapRef = useRef<Leaflet.Map | null>(null);
@@ -44,6 +46,7 @@ export default function MapView(props: Props) {
   const accCircleRef = useRef<Leaflet.Circle | null>(null);
   const routeLayerRef = useRef<Leaflet.LayerGroup | null>(null);
   const destMarkerRef = useRef<Leaflet.CircleMarker | null>(null);
+  const trackLayerRef = useRef<Leaflet.LayerGroup | null>(null);
   const callbacksRef = useRef(props);
   const [ready, setReady] = useState(false);
 
@@ -73,6 +76,7 @@ export default function MapView(props: Props) {
         { maxZoom: 19, subdomains: "abc", attribution: "CyclOSM", opacity: 0.85 },
       );
       routeLayerRef.current = L.layerGroup().addTo(map);
+      trackLayerRef.current = L.layerGroup().addTo(map);
       map.on("dragstart", () => callbacksRef.current.onUserPan());
       map.on("click", (e: Leaflet.LeafletMouseEvent) => {
         if (callbacksRef.current.pickMode) {
@@ -176,6 +180,26 @@ export default function MapView(props: Props) {
       fillOpacity: 1,
     }).addTo(map);
   }, [ready, destination]);
+
+  // 지난 주행 경로 표시
+  useEffect(() => {
+    const L = LRef.current;
+    const map = mapRef.current;
+    const group = trackLayerRef.current;
+    if (!ready || !L || !map || !group) return;
+    group.clearLayers();
+    if (!track || track.length === 0) return;
+    const latlngs = track.map((c) => [c.lat, c.lng] as [number, number]);
+    L.polyline(latlngs, { color: "#ffffff", weight: 9, opacity: 0.9 }).addTo(group);
+    const line = L.polyline(latlngs, { color: "#7c3aed", weight: 5 }).addTo(group);
+    const dot = (p: [number, number], fill: string, label: string) =>
+      L.circleMarker(p, { radius: 8, color: "#fff", weight: 3, fillColor: fill, fillOpacity: 1 })
+        .bindTooltip(label)
+        .addTo(group);
+    dot(latlngs[0], "#16a34a", "출발");
+    dot(latlngs[latlngs.length - 1], "#dc2626", "도착");
+    map.fitBounds(line.getBounds(), { padding: [40, 40] });
+  }, [ready, track]);
 
   return (
     <div
