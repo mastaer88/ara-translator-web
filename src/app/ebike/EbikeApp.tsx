@@ -34,9 +34,24 @@ import {
   type TrackPoint,
 } from "@/lib/ebike/rideStore";
 import { rideToGpx, shareFile } from "@/lib/ebike/gpx";
+import {
+  loadDeletedRides,
+  loadParking,
+  loadPlaces,
+  makePlace,
+  saveDeletedRides,
+  saveParking,
+  savePlaces,
+  type ParkingData,
+  type PlacesData,
+  type SavedPlace,
+} from "@/lib/ebike/places";
+import { loadSyncCode, syncNow } from "@/lib/ebike/sync";
 import { getKoreanVoices, isSpeechSupported, speak, unlockSpeech } from "@/lib/ebike/voice";
 import { loadSettings, saveSettings, type EbikeSettings } from "./settings";
 import HistorySheet from "./HistorySheet";
+import ParkingSheet from "./ParkingSheet";
+import SyncSection from "./SyncSection";
 import LocationSheet from "./LocationSheet";
 import { BigButton, MapButton, Row, Section, Sheet, Slider, Stat, Toggle } from "./ui";
 
@@ -121,7 +136,14 @@ export default function EbikeApp() {
   });
 
   // 화면
-  const [sheet, setSheet] = useState<"nav" | "settings" | "history" | "location" | null>(null);
+  const [sheet, setSheet] = useState<"nav" | "settings" | "history" | "location" | "parking" | null>(null);
+  const [places, setPlaces] = useState<PlacesData>(loadPlaces);
+  const [parkingData, setParkingData] = useState<ParkingData>(loadParking);
+  const [savingParking, setSavingParking] = useState(false);
+  const [focus, setFocus] = useState<{ p: LatLng; key: number } | null>(null);
+  const [syncCode, setSyncCode] = useState<string | null>(loadSyncCode);
+  const syncCodeRef = useRef(syncCode);
+  const syncingRef = useRef(false);
   const [follow, setFollow] = useState(true);
   const [locating, setLocating] = useState(false);
   const [pickMode, setPickMode] = useState(false);
@@ -444,6 +466,30 @@ export default function EbikeApp() {
       .catch(() => {});
   }, []);
 
+  useEffect(() => {
+    syncCodeRef.current = syncCode;
+  }, [syncCode]);
+
+  /** 동기화·복원 후 화면 데이터 다시 읽기 */
+  const reloadLocalData = useCallback(() => {
+    refreshRides();
+    setPlaces(loadPlaces());
+    setParkingData(loadParking());
+  }, [refreshRides]);
+
+  /** 동기화가 켜져 있으면 조용히 동기화 (실패해도 알림 없음) */
+  const autoSync = useCallback(() => {
+    const code = syncCodeRef.current;
+    if (!code || syncingRef.current) return;
+    syncingRef.current = true;
+    syncNow(code)
+      .then(reloadLocalData)
+      .catch((err) => console.warn("자동 동기화 실패", err))
+      .finally(() => {
+        syncingRef.current = false;
+      });
+  }, [reloadLocalData]);
+
   /** 주행 저장 후 출발·도착지 이름을 찾아 덧붙임 */
   const persistRide = useCallback(
     async (rec: RideRecord) => {
@@ -462,11 +508,12 @@ export default function EbikeApp() {
         ]);
         await saveRide({ ...rec, startName, endName });
         refreshRides();
+        autoSync();
       } catch {
         toast.error("주행 기록을 저장하지 못했습니다.");
       }
     },
-    [refreshRides],
+    [refreshRides, autoSync],
   );
 
   // 처음 열 때: 기록 목록 로드 + 비정상 종료된 주행 복구
@@ -479,8 +526,11 @@ export default function EbikeApp() {
         }
       })
       .catch(() => {})
-      .finally(refreshRides);
-  }, [persistRide, refreshRides]);
+      .finally(() => {
+        refreshRides();
+        autoSync();
+      });
+  }, [persistRide, refreshRides, autoSync]);
 
   const viewRide = (r: RideRecord) => {
     setViewing(r);
@@ -496,8 +546,10 @@ export default function EbikeApp() {
 
   const removeRide = async (r: RideRecord) => {
     await deleteRide(r.id);
+    saveDeletedRides([...loadDeletedRides(), r.id]);
     if (viewing?.id === r.id) setViewing(null);
     refreshRides();
+    autoSync();
   };
 
   // 1초 타이머: 경과 시간 + 시간 기준 주기 안내
@@ -556,6 +608,10 @@ export default function EbikeApp() {
     say(`주행을 종료합니다. 총 ${spokenDistance(r.distance)}, 평균 시속 ${Math.round(avg)}킬로미터`, true);
     toast.success(
       `주행 종료 · ${formatDistance(r.distance)} · ${formatDuration(r.elapsed)} · 평균 ${avg.toFixed(1)}km/h`,
+      {
+        duration: 15000,
+        action: { label: "🅿️ 주차 위치 저장", onClick: () => saveParkingHere("") },
+      },
     );
     setRideStatusBoth("idle");
     stopNavigation();
@@ -594,6 +650,87 @@ export default function EbikeApp() {
     setSheet("nav");
     const name = await reverseGeocode(p);
     chooseDestination({ name, location: p });
+  };
+
+  // ───────────── 즐겨찾기 목적지 ─────────────
+  const updatePlaces = (next: Omit<PlacesData, "updatedAt">) => {
+    const data = { ...next, updatedAt: Date.now() };
+    savePlaces(data);
+    setPlaces(data);
+    autoSync();
+  };
+
+  const saveFavorite = (kind: "home" | "work" | "fav") => {
+    if (!destination) return;
+    if (kind === "fav") {
+      const name = prompt("즐겨찾기 이름", destination.name)?.trim();
+      if (!name) return;
+      updatePlaces({ ...places, favorites: [...places.favorites, makePlace(name, destination.location)] });
+      toast.success(`'${name}'을(를) 즐겨찾기에 추가했습니다`);
+    } else {
+      const label = kind === "home" ? "집" : "회사";
+      updatePlaces({ ...places, [kind]: makePlace(destination.name, destination.location) });
+      toast.success(`${label}(으)로 저장했습니다`);
+    }
+  };
+
+  const goToPlace = (pl: SavedPlace | null, label: string) => {
+    if (!pl) {
+      toast.info(`${label}이(가) 아직 없습니다. 목적지를 검색한 뒤 '${label}(으)로 저장'을 눌러 주세요.`);
+      return;
+    }
+    setSheet("nav");
+    chooseDestination({ name: pl.name, location: { lat: pl.lat, lng: pl.lng } });
+  };
+
+  const removeFavorite = (pl: SavedPlace) => {
+    if (!confirm(`'${pl.name}'을(를) 즐겨찾기에서 지울까요?`)) return;
+    updatePlaces({ ...places, favorites: places.favorites.filter((f) => f.id !== pl.id) });
+  };
+
+  // ───────────── 주차 위치 ─────────────
+  const setParking = (parking: ParkingData["parking"]) => {
+    const data = { parking, updatedAt: Date.now() };
+    saveParking(data);
+    setParkingData(data);
+    autoSync();
+  };
+
+  function saveParkingHere(memo: string) {
+    const store = (p: LatLng, acc: number | null) => {
+      setParking({ lat: p.lat, lng: p.lng, accuracy: acc, memo, savedAt: Date.now() });
+      setSavingParking(false);
+      toast.success("주차 위치를 저장했습니다 🅿️");
+    };
+    // 주행 중이라 GPS가 켜져 있으면 그 위치를 바로 사용
+    if (watchIdRef.current !== null && positionRef.current) {
+      store(positionRef.current, accuracy);
+      return;
+    }
+    setSavingParking(true);
+    navigator.geolocation.getCurrentPosition(
+      (pos) => store({ lat: pos.coords.latitude, lng: pos.coords.longitude }, pos.coords.accuracy),
+      () => {
+        setSavingParking(false);
+        toast.error("현재 위치를 찾지 못해 주차 위치를 저장하지 못했습니다.");
+      },
+      { enableHighAccuracy: true, timeout: 15000, maximumAge: 5000 },
+    );
+  }
+
+  const navigateToParking = () => {
+    const pk = parkingData.parking;
+    if (!pk) return;
+    setSheet("nav");
+    chooseDestination({ name: "주차 위치", location: { lat: pk.lat, lng: pk.lng } });
+  };
+
+  const showParking = () => {
+    const pk = parkingData.parking;
+    if (!pk) return;
+    setSheet(null);
+    setFollow(false);
+    setFocus({ p: { lat: pk.lat, lng: pk.lng }, key: Date.now() });
   };
 
   const navigateToRideEnd = (r: RideRecord) => {
@@ -746,6 +883,8 @@ export default function EbikeApp() {
           route={route}
           destination={destination?.location ?? null}
           track={viewingTrack}
+          parking={parkingData.parking}
+          focus={focus}
           follow={follow}
           cycleLayer={settings.cycleLayer}
           pickMode={pickMode}
@@ -815,6 +954,9 @@ export default function EbikeApp() {
             label="자전거도로 지도"
           >
             🚲
+          </MapButton>
+          <MapButton active={!!parkingData.parking} onClick={() => setSheet("parking")} label="주차 위치">
+            🅿️
           </MapButton>
           <MapButton active={false} onClick={() => setSheet("location")} label="내 위치 정보">
             ℹ︎
@@ -903,6 +1045,40 @@ export default function EbikeApp() {
             📍 지도에서 목적지 선택
           </button>
 
+          <div className="mt-3 flex gap-2 overflow-x-auto pb-1">
+            <button
+              onClick={() => goToPlace(places.home, "집")}
+              className={`shrink-0 rounded-full px-4 py-2 text-sm ${places.home ? "bg-emerald-700" : "bg-slate-800 text-slate-400"}`}
+            >
+              🏠 집
+            </button>
+            <button
+              onClick={() => goToPlace(places.work, "회사")}
+              className={`shrink-0 rounded-full px-4 py-2 text-sm ${places.work ? "bg-emerald-700" : "bg-slate-800 text-slate-400"}`}
+            >
+              🏢 회사
+            </button>
+            {parkingData.parking && (
+              <button onClick={navigateToParking} className="shrink-0 rounded-full bg-blue-700 px-4 py-2 text-sm">
+                🅿️ 주차 위치
+              </button>
+            )}
+            {places.favorites.map((f) => (
+              <span key={f.id} className="flex shrink-0 items-center rounded-full bg-slate-800 text-sm">
+                <button onClick={() => goToPlace(f, f.name)} className="py-2 pl-4 pr-1">
+                  ⭐ {f.name}
+                </button>
+                <button
+                  onClick={() => removeFavorite(f)}
+                  className="px-2 py-2 text-slate-500"
+                  aria-label={`${f.name} 즐겨찾기 삭제`}
+                >
+                  ✕
+                </button>
+              </span>
+            ))}
+          </div>
+
           {results.length > 0 && (
             <ul className="mt-3 divide-y divide-slate-800 overflow-hidden rounded-xl bg-slate-800/60">
               {results.map((r, i) => (
@@ -949,6 +1125,17 @@ export default function EbikeApp() {
                   지우기
                 </button>
               </div>
+              <div className="mt-2 grid grid-cols-3 gap-2 text-xs">
+                <button onClick={() => saveFavorite("home")} className="rounded-lg bg-slate-700 py-1.5">
+                  🏠 집으로 저장
+                </button>
+                <button onClick={() => saveFavorite("work")} className="rounded-lg bg-slate-700 py-1.5">
+                  🏢 회사로 저장
+                </button>
+                <button onClick={() => saveFavorite("fav")} className="rounded-lg bg-slate-700 py-1.5">
+                  ⭐ 즐겨찾기
+                </button>
+              </div>
               {routing && <div className="mt-2 text-sm text-slate-300">경로 탐색 중…</div>}
               {!routing && route && (
                 <>
@@ -987,6 +1174,20 @@ export default function EbikeApp() {
           onExport={exportRide}
           onNavigate={navigateToRideEnd}
           onDelete={removeRide}
+        />
+      )}
+
+      {/* ───── 주차 위치 시트 ───── */}
+      {sheet === "parking" && (
+        <ParkingSheet
+          parking={parkingData.parking}
+          position={position}
+          saving={savingParking}
+          onSave={saveParkingHere}
+          onClear={() => setParking(null)}
+          onNavigate={navigateToParking}
+          onShow={showParking}
+          onClose={() => setSheet(null)}
         />
       )}
 
@@ -1119,6 +1320,8 @@ export default function EbikeApp() {
               onChange={(v) => update("cruiseSpeed", v)}
             />
           </Section>
+
+          <SyncSection code={syncCode} onCodeChange={setSyncCode} onDataChanged={reloadLocalData} />
 
           <Section title="화면">
             <Toggle

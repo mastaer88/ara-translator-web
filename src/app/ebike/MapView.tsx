@@ -14,6 +14,10 @@ type Props = {
   destination: LatLng | null;
   /** 기록 보기: 지난 주행 경로 */
   track: LatLng[] | null;
+  /** 저장한 주차 위치 */
+  parking: LatLng | null;
+  /** 값이 바뀔 때마다 지도를 이 위치로 이동 */
+  focus: { p: LatLng; key: number } | null;
   follow: boolean;
   cycleLayer: boolean;
   pickMode: boolean;
@@ -37,7 +41,7 @@ function positionIcon(L: typeof Leaflet, heading: number | null) {
 }
 
 export default function MapView(props: Props) {
-  const { position, heading, accuracy, route, destination, track, follow, cycleLayer } = props;
+  const { position, heading, accuracy, route, destination, track, parking, focus, follow, cycleLayer } = props;
   const containerRef = useRef<HTMLDivElement>(null);
   const LRef = useRef<typeof Leaflet | null>(null);
   const mapRef = useRef<Leaflet.Map | null>(null);
@@ -47,6 +51,7 @@ export default function MapView(props: Props) {
   const routeLayerRef = useRef<Leaflet.LayerGroup | null>(null);
   const destMarkerRef = useRef<Leaflet.CircleMarker | null>(null);
   const trackLayerRef = useRef<Leaflet.LayerGroup | null>(null);
+  const parkingMarkerRef = useRef<Leaflet.Marker | null>(null);
   const callbacksRef = useRef(props);
   const [ready, setReady] = useState(false);
 
@@ -180,6 +185,34 @@ export default function MapView(props: Props) {
       fillOpacity: 1,
     }).addTo(map);
   }, [ready, destination]);
+
+  // 주차 위치 표시
+  useEffect(() => {
+    const L = LRef.current;
+    const map = mapRef.current;
+    if (!ready || !L || !map) return;
+    parkingMarkerRef.current?.remove();
+    parkingMarkerRef.current = null;
+    if (!parking) return;
+    parkingMarkerRef.current = L.marker([parking.lat, parking.lng], {
+      icon: L.divIcon({
+        className: "",
+        iconSize: [34, 34],
+        iconAnchor: [17, 17],
+        html: '<div style="width:34px;height:34px;border-radius:8px;background:#2563eb;border:3px solid #fff;color:#fff;font:700 18px/28px sans-serif;text-align:center;box-shadow:0 1px 6px rgba(0,0,0,.4)">P</div>',
+      }),
+      zIndexOffset: 500,
+    })
+      .bindTooltip("주차 위치")
+      .addTo(map);
+  }, [ready, parking]);
+
+  // 특정 위치로 지도 이동 (주차 위치 보기 등)
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!ready || !map || !focus) return;
+    map.setView([focus.p.lat, focus.p.lng], 17, { animate: true });
+  }, [ready, focus]);
 
   // 지난 주행 경로 표시
   useEffect(() => {

@@ -47,4 +47,14 @@ Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/bui
   (자전거도로 우선 / 균형 / 빠른 길), 경로의 자전거도로 비율 표시,
   회전 음성 안내, 경로 이탈 시 자동 재탐색 (BRouter 실패 시 OSRM 자전거 경로 사용)
 
+- **주행 기록**: 코스 자동 저장, 누적·주간·월간 거리, 지도에서 코스 보기, GPX 내보내기
+- **즐겨찾기·주차 위치**: 집/회사/즐겨찾기 목적지, 자전거 세운 위치 저장·길찾기
+- **백업·동기화**: 백업 파일 저장/불러오기, 동기화 코드로 여러 기기 간 기록 공유
+
 웹앱이라 화면이 꺼지거나 다른 앱으로 전환하면 위치 추적·음성 안내가 멈춥니다.
+
+### 여러 기기 동기화 설정 (한 번만)
+
+Vercel 대시보드 → 프로젝트 → **Storage** → **Create Database** → **Upstash for Redis**(무료)를 만들고
+이 프로젝트에 연결한 뒤 다시 배포하세요. `KV_REST_API_URL`, `KV_REST_API_TOKEN` 환경변수가 자동으로 추가되며,
+`/api/ebike/sync`가 이를 사용합니다. (`UPSTASH_REDIS_REST_URL`/`UPSTASH_REDIS_REST_TOKEN` 이름도 지원)
