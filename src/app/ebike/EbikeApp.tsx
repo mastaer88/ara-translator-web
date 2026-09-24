@@ -993,6 +993,18 @@ export default function EbikeApp() {
     setNavigating(true);
     setFollow(true);
     setSheet(null);
+    // 다음 GPS 신호를 기다리지 않고 바로 안내 배너·도착 시간 표시 (정지 중에는 아이폰이 위치를 새로 보내지 않음)
+    const here = positionRef.current;
+    if (here) updateNavigation(here, accuracy ?? 10);
+    else {
+      const first = route.maneuvers[0] ?? null;
+      setProgress({
+        remaining: route.distance,
+        next: first,
+        distToNext: first ? first.distAlong : route.distance,
+        ...estimateEta(route.distance),
+      });
+    }
     const ratio =
       route.cyclewayRatio !== null ? `, 자전거도로 비율 ${Math.round(route.cyclewayRatio * 100)}퍼센트` : "";
     const s = settingsRef.current;
@@ -1054,6 +1066,22 @@ export default function EbikeApp() {
       },
       { enableHighAccuracy: true, timeout: 15000, maximumAge: 5000 },
     );
+  }, []);
+
+  // 안내 중에는 멈춰 있어도 5초마다 도착 시간 갱신
+  useEffect(() => {
+    if (!navigating) return;
+    const id = setInterval(() => {
+      setProgress((prev) => (prev ? { ...prev, ...estimateEta(prev.remaining) } : prev));
+    }, 5000);
+    return () => clearInterval(id);
+  }, [navigating, estimateEta]);
+
+  // 경로 요약의 도착 예정 시각용 현재 시각 (30초마다)
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 30000);
+    return () => clearInterval(id);
   }, []);
 
   // 1분마다 낮/밤 확인 (자동 야간 지도)
@@ -1500,7 +1528,10 @@ export default function EbikeApp() {
                 <>
                   <div className="mt-2 grid grid-cols-3 gap-2 text-center">
                     <Stat label="거리" value={formatDistance(route.distance)} />
-                    <Stat label="예상 시간" value={formatEta(planEtaSec)} />
+                    <Stat
+                      label={`도착 ${formatClock(now + planEtaSec * 1000)}`}
+                      value={formatEta(planEtaSec)}
+                    />
                     <Stat
                       label="자전거도로"
                       value={route.cyclewayRatio === null ? "-" : `${Math.round(route.cyclewayRatio * 100)}%`}
