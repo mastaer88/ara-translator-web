@@ -16,6 +16,7 @@ import { deleteRide, listRides, saveRide, type RideRecord } from "./rideStore";
 type Meta = { places?: PlacesData; parking?: ParkingData; deleted?: string[] };
 
 const CODE_KEY = "ebike-sync-code";
+const SERVER_KEY = "ebike-sync-server";
 const LAST_SYNC_KEY = "ebike-last-sync";
 const ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // 헷갈리는 0/O, 1/I 제외
 
@@ -58,8 +59,62 @@ export function loadLastSync(): number | null {
   }
 }
 
+/** 기록을 저장할 서버 주소 (예: PC). 비어 있으면 지금 열린 사이트의 서버 */
+export function loadSyncServer(): string {
+  try {
+    return localStorage.getItem(SERVER_KEY) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+export function saveSyncServer(url: string) {
+  try {
+    if (url) localStorage.setItem(SERVER_KEY, url);
+    else localStorage.removeItem(SERVER_KEY);
+  } catch {
+    // 무시
+  }
+}
+
+/** "abc.ts.net" → "https://abc.ts.net", 끝의 "/" · "/ebike" 제거 */
+export function normalizeServerUrl(input: string): string {
+  let url = input.trim();
+  if (!url) return "";
+  if (!/^https?:\/\//i.test(url)) url = `https://${url}`;
+  return url.replace(/\/+$/, "").replace(/\/ebike$/, "");
+}
+
+function endpoint(): string {
+  const base = loadSyncServer();
+  if (base.startsWith("http:") && location.protocol === "https:") {
+    throw new Error("PC 서버 주소는 https:// 로 시작해야 합니다 (아이폰 보안 정책)");
+  }
+  return `${base}/api/ebike/sync`;
+}
+
+async function request(init?: RequestInit): Promise<Response> {
+  try {
+    return await fetch(endpoint(), init);
+  } catch (err) {
+    if (err instanceof Error && err.message.includes("https://")) throw err;
+    throw new Error(
+      loadSyncServer()
+        ? "PC 서버에 연결할 수 없습니다. PC가 켜져 있고 서버(dev.bat)와 연결 프로그램이 실행 중인지 확인하세요."
+        : "서버에 연결할 수 없습니다. 인터넷 연결을 확인하세요.",
+    );
+  }
+}
+
+/** 서버 연결 확인 → 사용하는 저장소 종류 */
+export async function checkSyncServer(): Promise<"pc" | "redis" | null> {
+  const res = await request();
+  const data = (await res.json().catch(() => ({}))) as { storage?: "pc" | "redis" | null };
+  return data.storage ?? null;
+}
+
 async function api<T>(code: string, action: string, extra: Record<string, unknown> = {}): Promise<T> {
-  const res = await fetch("/api/ebike/sync", {
+  const res = await request({
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ code, action, ...extra }),
