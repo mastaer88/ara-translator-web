@@ -60,11 +60,21 @@ const MapView = dynamic(() => import("./MapView"), { ssr: false });
 type RideStatus = "idle" | "riding" | "paused";
 type GpsStatus = "off" | "waiting" | "on" | "error";
 type Destination = { name: string; location: LatLng };
+type EtaBasis = "current" | "average" | "setting";
 type NavProgress = {
   remaining: number;
   next: Maneuver | null;
   distToNext: number;
+  /** 남은 시간 (초) — 현재 속도 기반 실시간 계산 */
+  etaSec: number;
+  etaKmh: number;
+  etaBasis: EtaBasis;
+  /** 도착 예정 시각 (ms) */
+  arriveAt: number;
 };
+
+/** 이 속도(km/h) 이상이면 "달리는 중"으로 봄 */
+const MOVING_KMH = 3;
 
 /** 정확도가 이보다 나쁜 위치는 거리 누적에서 제외 (m) */
 const MAX_ACCURACY = 35;
@@ -117,6 +127,8 @@ export default function EbikeApp() {
   const [rides, setRides] = useState<RideRecord[]>([]);
   const [viewing, setViewing] = useState<RideRecord | null>(null);
   const overSpeedRef = useRef({ count: 0, lastWarn: 0 });
+  /** 도착 시간 계산용 속도: 지금 속도와 최근 몇 초 평균(지수 이동 평균) */
+  const etaSpeedRef = useRef<{ live: number; smooth: number | null }>({ live: 0, smooth: null });
   const [overSpeed, setOverSpeed] = useState(false);
 
   // 내비게이션
@@ -250,6 +262,35 @@ export default function EbikeApp() {
   }, [stopNavigation]);
 
   // ───────────── 길 안내 진행 ─────────────
+  /**
+   * 도착까지 남은 시간 (현재 속도 기반 실시간 계산)
+   * - 달리는 중: 최근 몇 초 평균 속도
+   * - 신호 대기 등 정지 중: 이번 주행의 평균 속도 (무한대로 늘어나지 않게)
+   * - 속도 정보 없음: 설정의 기본 속도
+   */
+  const estimateEta = useCallback((remaining: number) => {
+    const { live, smooth } = etaSpeedRef.current;
+    const r = rideRef.current;
+    const rideAvg = r.movingTime > 20 ? (r.distance / r.movingTime) * 3.6 : null;
+    let kmh: number;
+    let basis: EtaBasis;
+    if (live > MOVING_KMH && smooth !== null) {
+      kmh = smooth;
+      basis = "current";
+    } else if (rideAvg !== null && rideAvg > MOVING_KMH) {
+      kmh = rideAvg;
+      basis = "average";
+    } else if (smooth !== null) {
+      kmh = smooth;
+      basis = "average";
+    } else {
+      kmh = settingsRef.current.cruiseSpeed;
+      basis = "setting";
+    }
+    const etaSec = remaining / (kmh / 3.6);
+    return { etaSec, etaKmh: kmh, etaBasis: basis, arriveAt: Date.now() + etaSec * 1000 };
+  }, []);
+
   const updateNavigation = useCallback(
     (p: LatLng, acc: number) => {
       const nav = navRef.current;
@@ -292,7 +333,7 @@ export default function EbikeApp() {
       const idx = r.maneuvers.findIndex((m) => m.distAlong > proj.distAlong + 3);
       const next = idx >= 0 ? r.maneuvers[idx] : null;
       const distToNext = next ? next.distAlong - proj.distAlong : remaining;
-      setProgress({ remaining, next, distToNext });
+      setProgress({ remaining, next, distToNext, ...estimateEta(remaining) });
 
       if (!next || !settingsRef.current.navVoice) return;
       const stages = nav.announced.get(idx) ?? new Set();
@@ -320,7 +361,7 @@ export default function EbikeApp() {
         say(`${spokenDistance(distToNext)} 직진 후 ${next.text}`);
       }
     },
-    [computeRoute, say, stopNavigation],
+    [computeRoute, say, stopNavigation, estimateEta],
   );
 
   // ───────────── GPS 위치 처리 ─────────────
@@ -343,6 +384,11 @@ export default function EbikeApp() {
       if (rawSpeed !== null && rawSpeed >= 0) kmh = rawSpeed * 3.6;
       else if (dt > 0) kmh = (step / dt) * 3.6;
       if (kmh < 1.5 || kmh > 90) kmh = 0; // 정지 중 GPS 흔들림·튀는 값 제거
+
+      // 도착 시간용 속도: 달리는 동안의 속도를 약 5초 단위로 부드럽게 평균
+      const eta = etaSpeedRef.current;
+      eta.live = kmh;
+      if (kmh > MOVING_KMH) eta.smooth = eta.smooth === null ? kmh : eta.smooth * 0.8 + kmh * 0.2;
 
       setSpeed((prev) => (kmh === 0 ? 0 : prev * 0.3 + kmh * 0.7));
       setPosition(p);
@@ -588,6 +634,7 @@ export default function EbikeApp() {
       periodicRef.current = { lastTime: 0, lastDistance: 0 };
       trackRef.current = [];
       startedAtRef.current = Date.now();
+      etaSpeedRef.current = { live: 0, smooth: null };
       setViewing(null);
       setRide({ ...rideRef.current });
       say("주행을 시작합니다.");
@@ -749,6 +796,18 @@ export default function EbikeApp() {
     if (destination) computeRoute(destination, null, profile);
   };
 
+  // 안내 시작 전 예상 시간: 지금 달리는 중이면 현재 속도, 아니면 최근 주행 평균, 없으면 기본 속도
+  const recent = rides.slice(0, 10);
+  const recentMoving = recent.reduce((t, r) => t + r.movingTime, 0);
+  const recentAvg = recentMoving > 60 ? (recent.reduce((t, r) => t + r.distance, 0) / recentMoving) * 3.6 : null;
+  const plan: { kmh: number; label: string } =
+    speed > MOVING_KMH
+      ? { kmh: speed, label: `현재 속도 ${Math.round(speed)}km/h 기준` }
+      : recentAvg !== null && recentAvg > MOVING_KMH
+        ? { kmh: recentAvg, label: `최근 주행 평균 ${recentAvg.toFixed(1)}km/h 기준` }
+        : { kmh: settings.cruiseSpeed, label: `기본 속도 ${settings.cruiseSpeed}km/h 기준` };
+  const planEtaSec = route ? route.distance / (plan.kmh / 3.6) : 0;
+
   const startNavigation = () => {
     if (!route || !destination) return;
     unlockSpeech();
@@ -766,7 +825,8 @@ export default function EbikeApp() {
     }
     if (s.navVoice) {
       say(
-        `${destination.name}까지 길 안내를 시작합니다. 총 ${spokenDistance(route.distance)}${ratio}입니다.`,
+        `${destination.name}까지 길 안내를 시작합니다. 총 ${spokenDistance(route.distance)}${ratio}, ` +
+          `약 ${formatEta(planEtaSec)} 걸립니다.`,
       );
     }
   };
@@ -776,11 +836,12 @@ export default function EbikeApp() {
     if (!progress) return;
     unlockSpeech();
     const { next, distToNext } = progress;
+    const eta = `약 ${formatEta(progress.etaSec)} 후 도착 예정입니다.`;
     if (!next || next.type === "arrive") {
-      say(`목적지까지 ${spokenDistance(distToNext)} 남았습니다.`, true);
+      say(`목적지까지 ${spokenDistance(distToNext)} 남았습니다. ${eta}`, true);
     } else {
       say(
-        `${spokenDistance(distToNext)} 앞에서 ${next.text}. 목적지까지 ${spokenDistance(progress.remaining)}`,
+        `${spokenDistance(distToNext)} 앞에서 ${next.text}. 목적지까지 ${spokenDistance(progress.remaining)}, ${eta}`,
         true,
       );
     }
@@ -831,7 +892,6 @@ export default function EbikeApp() {
 
   // ───────────── 표시 값 ─────────────
   const avgSpeed = ride.movingTime > 0 ? (ride.distance / ride.movingTime) * 3.6 : 0;
-  const cruiseMs = (settings.cruiseSpeed * 1000) / 3600;
   const displaySpeed = Math.round(speed);
   const totalDistance =
     rides.reduce((sum, r) => sum + r.distance, 0) + (rideStatus !== "idle" ? ride.distance : 0);
@@ -906,8 +966,16 @@ export default function EbikeApp() {
                 <div className="text-2xl font-bold">{formatDistance(progress.distToNext)}</div>
                 <div className="truncate text-base">{progress.next?.text ?? "직진"}</div>
                 <div className="text-xs text-emerald-100">
-                  남은 거리 {formatDistance(progress.remaining)} · 약{" "}
-                  {formatEta(progress.remaining / cruiseMs)} · 🔊 다시 듣기
+                  남은 {formatDistance(progress.remaining)} · {formatEta(progress.etaSec)} 후 도착 (
+                  {formatClock(progress.arriveAt)})
+                </div>
+                <div className="text-[11px] text-emerald-200/80">
+                  {progress.etaBasis === "current"
+                    ? `현재 속도 ${Math.round(progress.etaKmh)}km/h 기준`
+                    : progress.etaBasis === "average"
+                      ? `정지 중 · 평균 ${progress.etaKmh.toFixed(1)}km/h 기준`
+                      : `기본 속도 ${Math.round(progress.etaKmh)}km/h 기준`}{" "}
+                  · 🔊 다시 듣기
                 </div>
               </div>
             </button>
@@ -1141,15 +1209,15 @@ export default function EbikeApp() {
                 <>
                   <div className="mt-2 grid grid-cols-3 gap-2 text-center">
                     <Stat label="거리" value={formatDistance(route.distance)} />
-                    <Stat label="예상 시간" value={formatEta(route.distance / cruiseMs)} />
+                    <Stat label="예상 시간" value={formatEta(planEtaSec)} />
                     <Stat
                       label="자전거도로"
                       value={route.cyclewayRatio === null ? "-" : `${Math.round(route.cyclewayRatio * 100)}%`}
                     />
                   </div>
                   <div className="mt-1 text-[11px] text-slate-500">
-                    {route.source === "brouter" ? "BRouter" : "OSRM 자전거"} 경로 · 예상 시간은 평균{" "}
-                    {settings.cruiseSpeed}km/h 기준
+                    {route.source === "brouter" ? "BRouter" : "OSRM 자전거"} 경로 · 예상 시간은 {plan.label}, 안내
+                    중에는 현재 속도로 실시간 계산
                   </div>
                   <button
                     onClick={startNavigation}
@@ -1312,7 +1380,7 @@ export default function EbikeApp() {
               onChange={(v) => update("speedLimit", v)}
             />
             <Slider
-              label={`평균 주행 속도 ${settings.cruiseSpeed}km/h (도착 시간 계산)`}
+              label={`기본 속도 ${settings.cruiseSpeed}km/h (주행 기록이 없을 때 도착 시간 계산)`}
               min={10}
               max={35}
               step={1}
@@ -1345,6 +1413,11 @@ export default function EbikeApp() {
       )}
     </div>
   );
+}
+
+function formatClock(ts: number): string {
+  const d = new Date(ts);
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 }
 
 function getCurrentPosition(): Promise<LatLng> {
