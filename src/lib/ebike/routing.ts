@@ -6,13 +6,17 @@ import { cumulativeDistances, haversine, projectOnRoute, type LatLng } from "./g
  * - trekking: 자전거도로 선호 + 거리 균형
  * - fastbike: 빠른 도로 위주 (차도 포함)
  */
-export type RouteProfile = "safety" | "trekking" | "fastbike" | "kakao";
+export type RouteProfile = "safety" | "trekking" | "fastbike" | "kakao" | "battery";
 
 export const PROFILE_LABELS: Record<RouteProfile, { name: string; desc: string }> = {
   safety: { name: "자전거도로 우선", desc: "자전거 전용·겸용도로를 최대한 이용" },
   trekking: { name: "균형", desc: "자전거도로 선호 + 거리 고려" },
   fastbike: { name: "빠른 길", desc: "최단 시간 위주, 차도 포함" },
   kakao: { name: "카카오 자전거", desc: "카카오맵 자전거 길찾기 · 한국어 안내 문구 (카카오 키 필요)" },
+  battery: {
+    name: "🔋 배터리 절약",
+    desc: "여러 경로의 오르막·거리·바람을 계산해 배터리를 가장 적게 쓰는 길",
+  },
 };
 
 export type TurnType =
@@ -53,6 +57,10 @@ export type Route = {
   landingUrl?: string | null;
   /** 요청한 방식 대신 다른 방식으로 찾은 경우 안내 */
   note?: string;
+  /** 각 좌표의 고도 (m) — 배터리 계산용 */
+  elev?: number[];
+  /** 경로 비교 화면에 보일 이름 */
+  label?: string;
 };
 
 export type Place = { name: string; detail: string; location: LatLng; distance?: number | null };
@@ -229,12 +237,17 @@ function cyclewayRatioFromMessages(messages?: string[][]): number | null {
   return total > 0 ? cycle / total : null;
 }
 
-async function routeWithBRouter(from: LatLng, to: LatLng, profile: RouteProfile): Promise<Route> {
-  const brouterProfile = profile === "kakao" ? "safety" : profile;
+async function routeWithBRouter(
+  from: LatLng,
+  to: LatLng,
+  profile: RouteProfile,
+  alternative = 0,
+): Promise<Route> {
+  const brouterProfile = profile === "kakao" || profile === "battery" ? "safety" : profile;
   const params = new URLSearchParams({
     lonlats: `${from.lng},${from.lat}|${to.lng},${to.lat}`,
     profile: brouterProfile,
-    alternativeidx: "0",
+    alternativeidx: String(alternative),
     format: "geojson",
     timode: "3",
   });
@@ -243,6 +256,9 @@ async function routeWithBRouter(from: LatLng, to: LatLng, profile: RouteProfile)
   if (!feature) throw new Error("경로를 찾지 못했습니다");
 
   const coords = feature.geometry.coordinates.map(([lng, lat]) => ({ lat, lng }));
+  // BRouter 좌표의 세 번째 값은 고도
+  const hasElev = feature.geometry.coordinates.every((c) => typeof c[2] === "number");
+  const elev = hasElev ? feature.geometry.coordinates.map((c) => c[2]) : undefined;
   const cum = cumulativeDistances(coords);
   const maneuvers: Maneuver[] = [];
   for (const hint of feature.properties.voicehints ?? []) {
@@ -264,6 +280,7 @@ async function routeWithBRouter(from: LatLng, to: LatLng, profile: RouteProfile)
     maneuvers,
     source: "brouter",
     profile,
+    elev,
   });
 }
 
@@ -445,6 +462,50 @@ export async function findBikeRoute(from: LatLng, to: LatLng, profile: RouteProf
     console.warn("BRouter 실패, OSRM으로 재시도", err);
     return await routeWithOsrm(from, to, profile);
   }
+}
+
+/** 고도가 없는 경로(카카오·OSRM)는 Open-Meteo 고도로 채움. 실패하면 고도 없이 (평지로 계산) */
+export async function ensureElevation(route: Route): Promise<Route> {
+  if (route.elev && route.elev.length === route.coords.length) return route;
+  try {
+    const { fetchElevations } = await import("./elevation");
+    return { ...route, elev: await fetchElevations(route.coords, route.cum) };
+  } catch (err) {
+    console.warn("고도 조회 실패", err);
+    return route;
+  }
+}
+
+/**
+ * 배터리 절약 경로 후보: BRouter 자전거도로 우선·균형·빠른 길 + 자전거도로 우선의 대안 경로.
+ * 비슷한 경로는 하나로 합치고, 모두 고도를 채워서 돌려준다.
+ */
+export async function findBatteryCandidates(from: LatLng, to: LatLng): Promise<Route[]> {
+  if (haversine(from, to) < 20) throw new Error("출발지와 목적지가 너무 가깝습니다");
+  const tries: [RouteProfile, number, string][] = [
+    ["safety", 0, "자전거도로 우선"],
+    ["trekking", 0, "균형"],
+    ["fastbike", 0, "빠른 길"],
+    ["safety", 1, "다른 길"],
+  ];
+  const results = await Promise.allSettled(
+    tries.map(([p, alt, label]) => routeWithBRouter(from, to, p, alt).then((r) => ({ ...r, label }))),
+  );
+  let routes = results.flatMap((r) => (r.status === "fulfilled" ? [r.value] : []));
+  if (routes.length === 0) routes = [{ ...(await routeWithOsrm(from, to, "battery")), label: "기본 경로" }];
+
+  // 거리 1% · 좌표가 거의 같은 경로는 중복으로 보고 제거
+  const unique: Route[] = [];
+  for (const r of routes) {
+    const dup = unique.some(
+      (u) =>
+        Math.abs(u.distance - r.distance) / Math.max(u.distance, 1) < 0.01 &&
+        u.coords.length > 2 &&
+        haversine(u.coords[Math.floor(u.coords.length / 2)], r.coords[Math.floor(r.coords.length / 2)]) < 50,
+    );
+    if (!dup) unique.push({ ...r, profile: "battery" });
+  }
+  return Promise.all(unique.map(ensureElevation));
 }
 
 /** 걷기 경로 (주차 위치로 걸어가기): 카카오 도보 → 실패하면 OSRM 도보 */
