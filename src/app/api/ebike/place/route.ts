@@ -4,6 +4,8 @@ import { NextResponse } from "next/server";
  * 카카오 로컬 API 프록시 (키를 브라우저에 노출하지 않음)
  * - GET ?q=검색어&lat=&lng=   : 장소·주소 검색
  * - GET ?lat=&lng=&reverse=1  : 좌표 → 주소
+ * - GET ?category=CS2&lat=&lng= : 주변 카테고리 장소 (가까운 순)
+ * - GET ?q=검색어&lat=&lng=&nearby=1 : 주변 키워드 장소 (가까운 순, 3km 이내)
  * KAKAO_REST_API_KEY 가 없으면 503 → 앱은 OpenStreetMap 검색으로 대체
  */
 
@@ -39,6 +41,9 @@ async function kakao<T>(path: string, params: Record<string, string>): Promise<{
   return res.json();
 }
 
+/** 카카오 카테고리 그룹 코드 중 자전거 주행에 쓸 만한 것 */
+const CATEGORIES = new Set(["CS2", "CE7", "FD6", "SW8", "PM9", "HP8", "PK6", "OL7", "MT1", "AT4"]);
+
 const num = (v: string | null) => (v !== null && Number.isFinite(Number(v)) ? Number(v) : null);
 
 export async function GET(req: Request) {
@@ -51,7 +56,8 @@ export async function GET(req: Request) {
 
   try {
     if (url.searchParams.get("reverse")) {
-      if (lat === null || lng === null) return NextResponse.json({ error: "좌표가 필요합니다" }, { status: 400 });
+      if (lat === null || lng === null)
+        return NextResponse.json({ error: "좌표가 필요합니다" }, { status: 400 });
       const { documents } = await kakao<KakaoCoord2Address>("/geo/coord2address.json", {
         x: String(lng),
         y: String(lat),
@@ -60,23 +66,62 @@ export async function GET(req: Request) {
       if (!d) return NextResponse.json({ name: null, address: null });
       const road = d.road_address;
       return NextResponse.json({
-        name: road?.building_name || road?.address_name.split(" ").slice(-2).join(" ") || d.address?.region_3depth_name || null,
-        address: road ? `${road.address_name}${d.address ? ` (지번 ${d.address.address_name})` : ""}` : d.address?.address_name ?? null,
+        name:
+          road?.building_name ||
+          road?.address_name.split(" ").slice(-2).join(" ") ||
+          d.address?.region_3depth_name ||
+          null,
+        address: road
+          ? `${road.address_name}${d.address ? ` (지번 ${d.address.address_name})` : ""}`
+          : (d.address?.address_name ?? null),
       });
     }
 
+    const near: Record<string, string> =
+      lat !== null && lng !== null ? { x: String(lng), y: String(lat) } : {};
+    const toPlaces = (docs: KakaoPlace[]) =>
+      docs.map((p) => ({
+        name: p.place_name,
+        detail: [p.road_address_name || p.address_name, p.category_name.split(" > ").pop()]
+          .filter(Boolean)
+          .join(" · "),
+        lat: Number(p.y),
+        lng: Number(p.x),
+        distance: p.distance ? Number(p.distance) : null,
+      }));
+
+    // 주변 카테고리 (편의점·카페 등)
+    const category = url.searchParams.get("category");
+    if (category) {
+      if (!CATEGORIES.has(category) || !near.x)
+        return NextResponse.json({ error: "잘못된 요청" }, { status: 400 });
+      const res = await kakao<KakaoPlace>("/search/category.json", {
+        category_group_code: category,
+        radius: "2000",
+        sort: "distance",
+        size: "15",
+        ...near,
+      });
+      return NextResponse.json({ places: toPlaces(res.documents) });
+    }
+
     if (!q) return NextResponse.json({ places: [] });
-    const near: Record<string, string> = lat !== null && lng !== null ? { x: String(lng), y: String(lat) } : {};
+
+    // 주변 키워드 (자전거 수리점·화장실 등)
+    if (url.searchParams.get("nearby") && near.x) {
+      const res = await kakao<KakaoPlace>("/search/keyword.json", {
+        query: q,
+        radius: "3000",
+        sort: "distance",
+        size: "15",
+        ...near,
+      });
+      return NextResponse.json({ places: toPlaces(res.documents) });
+    }
 
     // 1) 장소 이름 검색 (가게·건물·공원 등)
     const keyword = await kakao<KakaoPlace>("/search/keyword.json", { query: q, size: "10", ...near });
-    let places = keyword.documents.map((p) => ({
-      name: p.place_name,
-      detail: [p.road_address_name || p.address_name, p.category_name.split(" > ").pop()].filter(Boolean).join(" · "),
-      lat: Number(p.y),
-      lng: Number(p.x),
-      distance: p.distance ? Number(p.distance) : null,
-    }));
+    let places = toPlaces(keyword.documents);
 
     // 2) 결과가 없으면 주소 검색 (도로명·지번)
     if (places.length === 0) {

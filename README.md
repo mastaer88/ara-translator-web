@@ -63,6 +63,15 @@ Vercel → 프로젝트 → Settings → Environment Variables에 `KAKAO_REST_AP
 (PC 서버는 `.env.local`). 앱 설정에서 **카카오맵 → 사용 설정 ON**이 필요합니다.
 키가 없으면 OpenStreetMap 검색을 사용합니다.
 
+키를 넣으면 쓰는 카카오맵 API:
+
+| 기능 | 카카오 API | 키가 없을 때 |
+|---|---|---|
+| 장소·주소 검색, 좌표 → 주소 | 키워드 / 주소 검색, coord2address | OpenStreetMap |
+| 주변 찾기 (편의점·화장실·자전거 수리·카페 등) | 카테고리 / 키워드 장소 검색 (가까운 순) | 사용 불가 |
+| "카카오 자전거" 경로 옵션 | `/v2/routing/bicycle` | 자전거도로 우선(BRouter) |
+| 주차 위치까지 걷기 안내 | `/v2/routing/walk` | OSRM 도보 |
+
 ### 기록을 PC에 저장하기 (동기화)
 
 PC에서 서버(`dev.bat`)가 켜져 있으면 동기화한 주행 기록이 PC에 저장됩니다.
