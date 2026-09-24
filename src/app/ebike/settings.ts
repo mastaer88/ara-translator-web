@@ -30,6 +30,15 @@ export type EbikeSettings = {
   crashDetect: boolean;
   emergencyName: string;
   emergencyPhone: string;
+  /** 배터리 계산용 무게 (kg) */
+  riderKg: number;
+  bikeKg: number;
+  /** 자전거 모델 프리셋 */
+  bikeModel: "custom" | "tx8pro3";
+  /** TX8 PRO3 배터리 용량 (Ah, 48V) */
+  tx8BatteryAh: 15 | 20;
+  /** 속도 제한 해제 개조 버전 */
+  speedUnlocked: boolean;
 };
 
 export const DEFAULT_SETTINGS: EbikeSettings = {
@@ -52,6 +61,11 @@ export const DEFAULT_SETTINGS: EbikeSettings = {
   crashDetect: true,
   emergencyName: "",
   emergencyPhone: "",
+  riderKg: 70,
+  bikeKg: 25,
+  bikeModel: "custom",
+  tx8BatteryAh: 15,
+  speedUnlocked: false,
 };
 
 const KEY = "ebike-settings-v1";

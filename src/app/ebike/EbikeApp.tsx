@@ -16,6 +16,8 @@ import {
 import {
   NEARBY_KINDS,
   PROFILE_LABELS,
+  ensureElevation,
+  findBatteryCandidates,
   findBikeRoute,
   findWalkRoute,
   searchNearby,
@@ -73,6 +75,18 @@ import {
 import { getKoreanVoices, isSpeechSupported, speak, unlockSpeech } from "@/lib/ebike/voice";
 import { loadSettings, saveSettings, type EbikeSettings } from "./settings";
 import BatterySheet from "./BatterySheet";
+import CoachPanel from "./CoachPanel";
+import {
+  GENERIC_BIKE,
+  coach,
+  flatWhPerKm,
+  motoveloTx8Pro3,
+  referenceLevel,
+  routeEnergy,
+  type AssistLevel,
+  type BikeModel,
+  type RouteEnergy,
+} from "@/lib/ebike/energy";
 import Onboarding, { markOnboarded, shouldShowOnboarding } from "./Onboarding";
 import HistorySheet from "./HistorySheet";
 import SosOverlay from "./SosOverlay";
@@ -112,6 +126,26 @@ const MAX_ACCURACY = 35;
 const OFF_ROUTE_DIST = 45;
 /** 도착 판정 거리 (m) */
 const ARRIVE_DIST = 25;
+
+/** 설정에 맞는 자전거 모델 */
+function bikeModelOf(s: EbikeSettings): BikeModel {
+  return s.bikeModel === "tx8pro3" ? motoveloTx8Pro3(s.speedUnlocked) : GENERIC_BIKE;
+}
+
+/** 보조 단계 코치: 도착 시 최소로 남길 배터리 (%) */
+/** 현재 시각 (이벤트 처리용 — React 컴파일러가 렌더 중 호출로 오인하지 않도록 분리) */
+const nowMs = () => Date.now();
+
+const COACH_RESERVE = 15;
+
+/** 받침 유무에 맞는 조사 ("에코를", "보통을", "에코로", "보통으로") */
+function withParticle(word: string, withBatchim: string, without: string): string {
+  const code = word.charCodeAt(word.length - 1) - 0xac00;
+  const has = code >= 0 && code <= 11171 && code % 28 !== 0;
+  // "으로/로"는 ㄹ 받침 뒤에도 "로"
+  const rieul = code >= 0 && code % 28 === 8;
+  return word + (has && !(withBatchim === "으로" && rieul) ? withBatchim : without);
+}
 
 const THEME_LABEL: Record<EbikeSettings["mapTheme"], string> = {
   auto: "자동",
@@ -183,6 +217,9 @@ export default function EbikeApp() {
     destination: null as Destination | null,
     navigating: false,
     announced: new Map<number, Set<"straight" | "far" | "near">>(),
+    /** 보조 단계 코치: 마지막으로 확인한 지점(m)과 추천 단계 */
+    lastCoachAt: 0,
+    lastRec: "" as string,
     offCount: 0,
     lastReroute: 0,
     rerouting: false,
@@ -202,6 +239,16 @@ export default function EbikeApp() {
   const [follow, setFollow] = useState(true);
   const [locating, setLocating] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
+  const [candidates, setCandidates] = useState<Route[] | null>(null);
+  const [coachLive, setCoachLive] = useState<string | null>(null);
+  /** 경로 계산·주행 중 코치가 최신 배터리·날씨·에너지를 읽기 위한 참조 */
+  const energyRef = useRef<{
+    whPerKm: number;
+    wind: { ms: number; fromDeg: number } | null;
+    energy: RouteEnergy | null;
+    percent: number | null;
+    capacity: number;
+  }>({ whPerKm: 10, wind: null, energy: null, percent: null, capacity: 360 });
   const [onboarding, setOnboarding] = useState(shouldShowOnboarding);
   const [bigSpeed, setBigSpeed] = useState(false);
   const [night, setNight] = useState(() => isNight());
@@ -284,14 +331,50 @@ export default function EbikeApp() {
       }
       setRouting(true);
       try {
-        const r = dest.walk
-          ? await findWalkRoute(origin, dest.location)
-          : await findBikeRoute(origin, dest.location, profile ?? settingsRef.current.profile);
+        const prof = profile ?? settingsRef.current.profile;
+        let r: Route;
+        if (!dest.walk && prof === "battery") {
+          // 여러 경로의 배터리 사용량(보통 단계)을 계산해 가장 적은 경로 선택
+          const s = settingsRef.current;
+          const e = energyRef.current;
+          const list = await findBatteryCandidates(origin, dest.location);
+          const scored = list
+            .map((c) => ({
+              c,
+              wh: (() => {
+                const model = bikeModelOf(s);
+                const en = routeEnergy(c.coords, c.elev ?? null, {
+                  massKg: s.riderKg + s.bikeKg,
+                  whPerKm: e.whPerKm,
+                  wind: e.wind,
+                  model,
+                });
+                return en.levels[model.levels.indexOf(referenceLevel(model))].wh;
+              })(),
+            }))
+            .sort((a, b) => a.wh - b.wh);
+          r = scored[0].c;
+          setCandidates(scored.map((x) => x.c));
+        } else {
+          r = dest.walk
+            ? await findWalkRoute(origin, dest.location)
+            : await findBikeRoute(origin, dest.location, prof);
+          setCandidates(null);
+        }
         if (r.note) toast.info(r.note);
         navRef.current.route = r;
         navRef.current.announced = new Map();
         navRef.current.offCount = 0;
+        navRef.current.lastCoachAt = 0;
         setRoute(r);
+        // 고도가 없는 경로(카카오 등)는 뒤에서 고도를 채워 배터리 계산을 정확하게
+        if (!dest.walk && !r.elev) {
+          ensureElevation(r).then((withElev) => {
+            if (navRef.current.route !== r || !withElev.elev) return;
+            navRef.current.route = withElev;
+            setRoute(withElev);
+          });
+        }
         return r;
       } catch (err) {
         toast.error(`경로 탐색 실패: ${err instanceof Error ? err.message : String(err)}`);
@@ -390,6 +473,43 @@ export default function EbikeApp() {
       const next = idx >= 0 ? r.maneuvers[idx] : null;
       const distToNext = next ? next.distAlong - proj.distAlong : remaining;
       setProgress({ remaining, next, distToNext, ...estimateEta(remaining) });
+
+      // 보조 단계 코치: 1km마다 남은 구간의 배터리를 다시 계산해 추천 단계가 바뀌면 알림
+      const ec = energyRef.current;
+      if (ec.energy && ec.percent !== null && proj.distAlong - nav.lastCoachAt >= 1000) {
+        nav.lastCoachAt = proj.distAlong;
+        const at = Math.min(proj.index, ec.energy.levels[0].cumWh.length - 1);
+        let rec: AssistLevel | null = null;
+        let recArrive = 0;
+        for (const l of ec.energy.levels) {
+          const arrive = ec.percent - ((l.wh - l.cumWh[at]) / ec.capacity) * 100;
+          if (arrive >= COACH_RESERVE) {
+            rec = l.level;
+            recArrive = arrive;
+          }
+        }
+        const id = rec?.id ?? "none";
+        const levels = ec.energy.levels;
+        if (id !== nav.lastRec) {
+          const idxOf = (x: string) => levels.findIndex((l) => l.level.id === x);
+          const lower = idxOf(id) < idxOf(nav.lastRec);
+          nav.lastRec = id;
+          setCoachLive(
+            rec
+              ? `추천 보조 ${rec.name} · 도착 ${Math.round(recArrive)}%`
+              : "배터리 부족 — 가장 낮은 단계로 달리세요",
+          );
+          if (settingsRef.current.navVoice) {
+            say(
+              !rec
+                ? `배터리가 부족할 수 있습니다. ${levels[0].level.name} 단계로 달리고 충전을 고려하세요.`
+                : lower
+                  ? `배터리를 아끼려면 보조 단계를 ${withParticle(rec.name, "으로", "로")} 낮추세요.`
+                  : `배터리 여유가 있습니다. ${withParticle(rec.name, "으로", "로")} 올려도 도착할 수 있습니다.`,
+            );
+          }
+        }
+      }
 
       if (!next || !settingsRef.current.navVoice) return;
       const stages = nav.announced.get(idx) ?? new Set();
@@ -750,7 +870,7 @@ export default function EbikeApp() {
       rideRef.current = { ...EMPTY_RIDE };
       periodicRef.current = { lastTime: 0, lastDistance: 0 };
       trackRef.current = [];
-      startedAtRef.current = Date.now();
+      startedAtRef.current = nowMs();
       etaSpeedRef.current = { live: 0, smooth: null };
       setViewing(null);
       setRide({ ...rideRef.current });
@@ -879,9 +999,32 @@ export default function EbikeApp() {
     updatePlaces({ ...places, favorites: places.favorites.filter((f) => f.id !== pl.id) });
   };
 
+  // ───────────── 내 자전거 모델 ─────────────
+  /** 모델·배터리·속도 해제 선택: 배터리 용량·무게·기본 속도·제한 속도·소모량을 함께 맞춤 */
+  const applyBike = (next: Pick<EbikeSettings, "bikeModel" | "tx8BatteryAh" | "speedUnlocked">) => {
+    const merged = { ...settings, ...next };
+    if (next.bikeModel === "tx8pro3") {
+      const model = motoveloTx8Pro3(next.speedUnlocked);
+      merged.bikeKg = 26;
+      merged.cruiseSpeed = next.speedUnlocked ? 28 : 20;
+      merged.speedLimit = next.speedUnlocked ? 40 : 25;
+      const ref = referenceLevel(model);
+      updateBattery({
+        ...battery,
+        capacityWh: (model.batteryV ?? 48) * next.tx8BatteryAh,
+        // 주행으로 학습된 소모량이 없으면 모델의 평지 기준값 사용
+        whPerKm:
+          battery.learned > 0
+            ? battery.whPerKm
+            : Math.round(flatWhPerKm(model, ref, merged.riderKg + merged.bikeKg) * 10) / 10,
+      });
+    }
+    setSettings(merged);
+  };
+
   // ───────────── 주차 위치 ─────────────
   const setParking = (parking: ParkingData["parking"]) => {
-    const data = { parking, updatedAt: Date.now() };
+    const data = { parking, updatedAt: nowMs() };
     saveParking(data);
     setParkingData(data);
     autoSync();
@@ -945,8 +1088,58 @@ export default function EbikeApp() {
   const odometer =
     rides.reduce((sum, r) => sum + r.distance, 0) + (rideStatus !== "idle" ? ride.distance : 0);
   const batteryEst = estimateBattery(battery, odometer);
-  const routeBatteryLeft =
-    batteryEst && route
+  // 보조 단계별 배터리 사용량 (오르막·바람·무게 반영)
+  const massKg = settings.riderKg + settings.bikeKg;
+  const bikeModel = useMemo(
+    () => bikeModelOf(settings),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [settings.bikeModel, settings.speedUnlocked],
+  );
+  const windOpt = useMemo(
+    () => (weather ? { ms: weather.windMs, fromDeg: weather.windFromDeg } : null),
+    [weather],
+  );
+  const routeEnergyNow = useMemo(
+    () =>
+      route && !route.walk
+        ? routeEnergy(route.coords, route.elev ?? null, {
+            massKg,
+            whPerKm: battery.whPerKm,
+            wind: windOpt,
+            model: bikeModel,
+          })
+        : null,
+    [route, massKg, battery.whPerKm, windOpt, bikeModel],
+  );
+  const candidateEnergies = useMemo(
+    () =>
+      candidates?.map((c) => ({
+        route: c,
+        energy: routeEnergy(c.coords, c.elev ?? null, {
+          massKg,
+          whPerKm: battery.whPerKm,
+          wind: windOpt,
+          model: bikeModel,
+        }),
+      })) ?? null,
+    [candidates, massKg, battery.whPerKm, windOpt, bikeModel],
+  );
+  const advice =
+    batteryEst && routeEnergyNow
+      ? coach(routeEnergyNow, batteryEst.percent, battery.capacityWh, COACH_RESERVE)
+      : null;
+  useEffect(() => {
+    energyRef.current = {
+      whPerKm: battery.whPerKm,
+      wind: windOpt,
+      energy: routeEnergyNow,
+      percent: batteryEst?.percent ?? null,
+      capacity: battery.capacityWh,
+    };
+  });
+  const routeBatteryLeft = advice
+    ? advice.arrivePercent[referenceLevel(bikeModel).id]
+    : batteryEst && route
       ? batteryEst.percent - ((route.distance / 1000) * battery.whPerKm * 100) / battery.capacityWh
       : null;
   const routeWind =
@@ -982,6 +1175,19 @@ export default function EbikeApp() {
   const walkPlan = route?.walk ? { kmh: WALK_KMH, label: `걷는 속도 ${WALK_KMH}km/h 기준` } : null;
   const planEtaSec = route ? route.distance / ((walkPlan ?? plan).kmh / 3.6) : 0;
 
+  // 보조 단계 코치 문구 (안내 시작 시 음성·배너)
+  const coachRecId = advice ? (advice.recommended?.id ?? "none") : "";
+  const coachSpeech = advice
+    ? advice.recommended
+      ? `보조 단계는 ${advice.recommended.name}까지 써도 됩니다. 도착 시 배터리 약 ${Math.round(advice.arrivePercent[advice.recommended.id])}퍼센트입니다.`
+      : `배터리가 부족할 수 있습니다. ${bikeModel.levels[0].name} 단계로도 약 ${(advice.shortKm ?? 0).toFixed(1)}킬로미터 부족합니다.`
+    : null;
+  const coachBanner = advice
+    ? advice.recommended
+      ? `보조 ${advice.recommended.name}까지 OK · 도착 ${Math.round(advice.arrivePercent[advice.recommended.id])}%`
+      : "배터리 부족 — 가장 낮은 단계로 달리세요"
+    : null;
+
   const startNavigation = () => {
     if (!route || !destination) return;
     unlockSpeech();
@@ -992,21 +1198,12 @@ export default function EbikeApp() {
     } else if (rideStatus !== "riding") startRide();
     navRef.current.navigating = true;
     navRef.current.announced = new Map();
+    navRef.current.lastCoachAt = 0;
+    navRef.current.lastRec = coachRecId;
+    setCoachLive(coachBanner);
     setNavigating(true);
     setFollow(true);
     setSheet(null);
-    // 다음 GPS 신호를 기다리지 않고 바로 안내 배너·도착 시간 표시 (정지 중에는 아이폰이 위치를 새로 보내지 않음)
-    const here = positionRef.current;
-    if (here) updateNavigation(here, accuracy ?? 10);
-    else {
-      const first = route.maneuvers[0] ?? null;
-      setProgress({
-        remaining: route.distance,
-        next: first,
-        distToNext: first ? first.distAlong : route.distance,
-        ...estimateEta(route.distance),
-      });
-    }
     const ratio =
       route.cyclewayRatio !== null ? `, 자전거도로 비율 ${Math.round(route.cyclewayRatio * 100)}퍼센트` : "";
     const s = settingsRef.current;
@@ -1019,11 +1216,25 @@ export default function EbikeApp() {
           `총 ${spokenDistance(route.distance)}${ratio}, ` +
           `약 ${formatEta(planEtaSec)} 걸립니다.`,
       );
-      if (routeBatteryLeft !== null && routeBatteryLeft < 10)
+      if (coachSpeech) {
+        say(coachSpeech);
+      } else if (routeBatteryLeft !== null && routeBatteryLeft < 10)
         say("배터리가 부족할 수 있습니다. 충전 상태를 확인하세요.");
       if (weather && weather.rainChance >= 50)
         say(`3시간 안에 비 올 확률 ${weather.rainChance}퍼센트입니다.`);
       if (routeWind !== null && routeWind >= 4) say("맞바람이 강합니다. 평소보다 느릴 수 있습니다.");
+    }
+    // 시작 안내 음성 뒤에, 다음 GPS 신호를 기다리지 않고 바로 안내 배너·도착 시간 표시 (정지 중에는 아이폰이 위치를 새로 보내지 않음)
+    const here = positionRef.current;
+    if (here) updateNavigation(here, accuracy ?? 10);
+    else {
+      const first = route.maneuvers[0] ?? null;
+      setProgress({
+        remaining: route.distance,
+        next: first,
+        distToNext: first ? first.distAlong : route.distance,
+        ...estimateEta(route.distance),
+      });
     }
   };
 
@@ -1184,7 +1395,12 @@ export default function EbikeApp() {
           </div>
           {bigSpeed && navigating && progress && (
             <div className="mx-auto mt-4 w-full max-w-md">
-              <NavBanner progress={progress} onRepeat={repeatInstruction} onStop={stopNavigation} />
+              <NavBanner
+                progress={progress}
+                coachText={coachLive}
+                onRepeat={repeatInstruction}
+                onStop={stopNavigation}
+              />
             </div>
           )}
           {bigSpeed && (
@@ -1223,7 +1439,12 @@ export default function EbikeApp() {
 
           {navigating && progress && (
             <div className="absolute inset-x-3 top-3 z-[1000]">
-              <NavBanner progress={progress} onRepeat={repeatInstruction} onStop={stopNavigation} />
+              <NavBanner
+                progress={progress}
+                coachText={coachLive}
+                onRepeat={repeatInstruction}
+                onStop={stopNavigation}
+              />
             </div>
           )}
 
@@ -1548,6 +1769,22 @@ export default function EbikeApp() {
                         : "OSRM"}{" "}
                     경로 · 예상 시간은 {(walkPlan ?? plan).label}, 안내 중에는 현재 속도로 실시간 계산
                   </div>
+                  {routeEnergyNow && (
+                    <CoachPanel
+                      candidates={settings.profile === "battery" ? candidateEnergies : null}
+                      selected={route}
+                      onSelect={(r) => {
+                        navRef.current.route = r;
+                        navRef.current.announced = new Map();
+                        navRef.current.lastCoachAt = 0;
+                        setRoute(r);
+                      }}
+                      energy={routeEnergyNow}
+                      advice={advice}
+                      capacityWh={battery.capacityWh}
+                      onOpenBattery={() => setSheet("battery")}
+                    />
+                  )}
                   {route.landingUrl && (
                     <a
                       href={route.landingUrl}
@@ -1784,6 +2021,91 @@ export default function EbikeApp() {
             </button>
           </Section>
 
+          <Section title="내 자전거">
+            <Row label="모델">
+              <select
+                value={settings.bikeModel}
+                onChange={(e) =>
+                  applyBike({
+                    bikeModel: e.target.value as EbikeSettings["bikeModel"],
+                    tx8BatteryAh: settings.tx8BatteryAh,
+                    speedUnlocked: settings.speedUnlocked,
+                  })
+                }
+                className="rounded-lg bg-slate-800 px-2 py-1"
+              >
+                <option value="custom">직접 입력</option>
+                <option value="tx8pro3">모토벨로 TX8 PRO3</option>
+              </select>
+            </Row>
+            {settings.bikeModel === "tx8pro3" && (
+              <>
+                <Row label="배터리 (48V)">
+                  <select
+                    value={settings.tx8BatteryAh}
+                    onChange={(e) =>
+                      applyBike({
+                        bikeModel: "tx8pro3",
+                        tx8BatteryAh: Number(e.target.value) as 15 | 20,
+                        speedUnlocked: settings.speedUnlocked,
+                      })
+                    }
+                    className="rounded-lg bg-slate-800 px-2 py-1"
+                  >
+                    <option value={15}>15Ah (720Wh)</option>
+                    <option value={20}>20Ah (960Wh)</option>
+                  </select>
+                </Row>
+                <Toggle
+                  label="속도 제한 해제 버전"
+                  value={settings.speedUnlocked}
+                  onChange={(v) =>
+                    applyBike({ bikeModel: "tx8pro3", tx8BatteryAh: settings.tx8BatteryAh, speedUnlocked: v })
+                  }
+                />
+                {settings.speedUnlocked && (
+                  <p className="rounded-lg bg-red-950/60 p-2 text-xs leading-relaxed text-red-200">
+                    ⚠️ 25km/h를 넘도록 개조한 전기자전거는 법적으로 자전거가 아니라 <b>원동기장치자전거</b>로
+                    분류됩니다. 자전거도로 통행이 금지되고 면허·번호판·보험이 필요하며, 사고 시 보험 처리가
+                    거절될 수 있습니다. 사유지·트랙 등 허용된 곳에서만 사용하세요. 이 설정은 배터리·도착 시간
+                    계산에만 쓰입니다.
+                  </p>
+                )}
+                <p className="text-xs text-slate-400">
+                  500W 모터 · 20×2.4 팻타이어 · 25.8kg · PAS 3단 + 스로틀 기준으로 계산합니다.
+                </p>
+              </>
+            )}
+            <Slider
+              label={`내 몸무게 ${settings.riderKg}kg`}
+              min={30}
+              max={140}
+              step={1}
+              value={settings.riderKg}
+              onChange={(v) => update("riderKg", v)}
+            />
+            <Slider
+              label={`자전거 무게 ${settings.bikeKg}kg (짐 포함)`}
+              min={12}
+              max={60}
+              step={1}
+              value={settings.bikeKg}
+              onChange={(v) => update("bikeKg", v)}
+            />
+            <div>
+              <div className="mb-1 text-xs text-slate-400">
+                완충 시 평지 주행 가능 거리 (배터리 {battery.capacityWh}Wh · 무풍)
+              </div>
+              <div className="grid grid-cols-4 gap-1 text-center">
+                {bikeModel.levels.map((l) => {
+                  const scale = battery.whPerKm / flatWhPerKm(bikeModel, referenceLevel(bikeModel), massKg);
+                  const km = battery.capacityWh / (flatWhPerKm(bikeModel, l, massKg) * scale);
+                  return <Stat key={l.id} label={`${l.name} · ${l.kmh}km/h`} value={`${Math.round(km)}km`} />;
+                })}
+              </div>
+            </div>
+          </Section>
+
           <Section title="속도">
             <Toggle
               label="속도 초과 경고"
@@ -1894,10 +2216,12 @@ export default function EbikeApp() {
 /** 길 안내 배너 (지도 위 / 속도계 크게 보기 공용) */
 function NavBanner({
   progress,
+  coachText,
   onRepeat,
   onStop,
 }: {
   progress: NavProgress;
+  coachText?: string | null;
   onRepeat: () => void;
   onStop: () => void;
 }) {
@@ -1929,6 +2253,7 @@ function NavBanner({
                   : `기본 속도 ${Math.round(progress.etaKmh)}km/h 기준`}{" "}
               · 🔊 다시 듣기
             </div>
+            {coachText && <div className="mt-0.5 text-xs font-semibold text-yellow-200">🔋 {coachText}</div>}
           </div>
         </button>
         <button
