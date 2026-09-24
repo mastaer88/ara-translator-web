@@ -68,6 +68,9 @@ export default function MapView(props: Props) {
     callbacksRef.current = props;
   });
 
+  // 진행 방향 위 모드에서는 지도가 돌아가므로 화살표는 항상 위쪽
+  const arrowHeading = heading === null ? null : headingUp ? 0 : heading;
+
   // 지도 초기화
   useEffect(() => {
     let cancelled = false;
@@ -131,7 +134,7 @@ export default function MapView(props: Props) {
     const ll: Leaflet.LatLngExpression = [position.lat, position.lng];
     if (!posMarkerRef.current) {
       posMarkerRef.current = L.marker(ll, {
-        icon: positionIcon(L, heading),
+        icon: positionIcon(L, arrowHeading),
         zIndexOffset: 1000,
         interactive: false,
       }).addTo(map);
@@ -145,10 +148,10 @@ export default function MapView(props: Props) {
       map.setView(ll, 16);
     } else {
       posMarkerRef.current.setLatLng(ll);
-      posMarkerRef.current.setIcon(positionIcon(L, heading));
+      posMarkerRef.current.setIcon(positionIcon(L, arrowHeading));
       accCircleRef.current?.setLatLng(ll).setRadius(accuracy ?? 0);
     }
-  }, [ready, position, heading, accuracy]);
+  }, [ready, position, arrowHeading, accuracy]);
 
   // 숨겨졌다가 다시 보일 때 지도 크기 재계산
   useEffect(() => {
@@ -264,10 +267,9 @@ export default function MapView(props: Props) {
   }, [ready, track]);
 
   return (
-    <div
-      ref={containerRef}
-      className={`absolute inset-0 ${props.pickMode ? "cursor-crosshair" : ""} ${dark ? "ebike-map-dark" : ""}`}
-      style={{ background: "#e5e7eb" }}
-    />
+    // React가 바꾸는 class는 바깥 div에만 둔다 (Leaflet이 지도 div에 붙인 class를 덮어쓰지 않도록)
+    <div className={`absolute inset-0 ${props.pickMode ? "cursor-crosshair" : ""} ${dark ? "ebike-map-dark" : ""}`}>
+      <div ref={containerRef} className="absolute inset-0" style={{ background: dark ? "#1a1f29" : "#e5e7eb" }} />
+    </div>
   );
 }

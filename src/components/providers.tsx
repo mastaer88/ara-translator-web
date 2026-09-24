@@ -16,7 +16,8 @@ export function ToasterProvider() {
         duration={2500}
         visibleToasts={2}
         offset={{ bottom: 110 }}
-        mobileOffset={{ bottom: "calc(env(safe-area-inset-bottom) + 96px)" }}
+        // 지도 좌우 버튼(나침반·현재 위치)을 가리지 않도록 가운데에 좁게
+        mobileOffset={{ bottom: "calc(env(safe-area-inset-bottom) + 96px)", left: 80, right: 80 }}
       />
     );
   }

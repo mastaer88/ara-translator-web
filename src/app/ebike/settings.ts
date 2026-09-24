@@ -26,6 +26,10 @@ export type EbikeSettings = {
   mapTheme: "auto" | "light" | "dark";
   /** 진행 방향이 위로 오게 지도 회전 */
   headingUp: boolean;
+  /** 넘어짐 감지 */
+  crashDetect: boolean;
+  emergencyName: string;
+  emergencyPhone: string;
 };
 
 export const DEFAULT_SETTINGS: EbikeSettings = {
@@ -45,6 +49,9 @@ export const DEFAULT_SETTINGS: EbikeSettings = {
   keepAwake: true,
   mapTheme: "auto",
   headingUp: false,
+  crashDetect: true,
+  emergencyName: "",
+  emergencyPhone: "",
 };
 
 const KEY = "ebike-settings-v1";

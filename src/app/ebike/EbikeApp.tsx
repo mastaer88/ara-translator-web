@@ -4,6 +4,7 @@ import dynamic from "next/dynamic";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 import {
+  bearing,
   formatDistance,
   formatDuration,
   formatEta,
@@ -46,11 +47,30 @@ import {
   type PlacesData,
   type SavedPlace,
 } from "@/lib/ebike/places";
+import { addressOf } from "@/lib/ebike/routing";
 import { loadSyncCode, syncNow } from "@/lib/ebike/sync";
 import { isNight } from "@/lib/ebike/sun";
+import {
+  estimateBattery,
+  loadBattery,
+  recordPercent,
+  saveBattery,
+  type BatteryState,
+} from "@/lib/ebike/battery";
+import { CrashDetector, requestMotionPermission } from "@/lib/ebike/crash";
+import {
+  describeWeather,
+  fetchWeather,
+  headwind,
+  windEffectText,
+  windName,
+  type Weather,
+} from "@/lib/ebike/weather";
 import { getKoreanVoices, isSpeechSupported, speak, unlockSpeech } from "@/lib/ebike/voice";
 import { loadSettings, saveSettings, type EbikeSettings } from "./settings";
+import BatterySheet from "./BatterySheet";
 import HistorySheet from "./HistorySheet";
+import SosOverlay from "./SosOverlay";
 import ParkingSheet from "./ParkingSheet";
 import SyncSection from "./SyncSection";
 import LocationSheet from "./LocationSheet";
@@ -160,7 +180,9 @@ export default function EbikeApp() {
   });
 
   // 화면
-  const [sheet, setSheet] = useState<"nav" | "settings" | "history" | "location" | "parking" | null>(null);
+  const [sheet, setSheet] = useState<
+    "nav" | "settings" | "history" | "location" | "parking" | "battery" | null
+  >(null);
   const [places, setPlaces] = useState<PlacesData>(loadPlaces);
   const [parkingData, setParkingData] = useState<ParkingData>(loadParking);
   const [savingParking, setSavingParking] = useState(false);
@@ -173,6 +195,12 @@ export default function EbikeApp() {
   const [menuOpen, setMenuOpen] = useState(false);
   const [bigSpeed, setBigSpeed] = useState(false);
   const [night, setNight] = useState(() => isNight());
+  const [battery, setBattery] = useState<BatteryState>(loadBattery);
+  const lowBatteryRef = useRef<number | null>(null);
+  const [weather, setWeather] = useState<Weather | null>(null);
+  const [sos, setSos] = useState<"check" | "sos" | null>(null);
+  const [sosAddress, setSosAddress] = useState<string | null>(null);
+  const crashRef = useRef<CrashDetector | null>(null);
   const [pickMode, setPickMode] = useState(false);
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<Place[]>([]);
@@ -408,7 +436,9 @@ export default function EbikeApp() {
       setSpeed((prev) => (kmh === 0 ? 0 : prev * 0.3 + kmh * 0.7));
       setPosition(p);
       setAccuracy(acc);
-      if (rawHeading !== null && !Number.isNaN(rawHeading) && kmh > 3) setHeading(rawHeading);
+      if (rawHeading !== null && !Number.isNaN(rawHeading) && rawHeading >= 0 && kmh > 3) setHeading(rawHeading);
+      // 방향 정보가 없으면 직전 위치에서 이동한 방향으로 계산
+      else if (last && step >= 5 && kmh > 3) setHeading(bearing(last.p, p));
       positionRef.current = p;
       setGpsStatus("on");
 
@@ -460,6 +490,7 @@ export default function EbikeApp() {
         setOverSpeed(false);
       }
 
+      if (rideStatusRef.current === "riding") crashRef.current?.feedSpeed(kmh);
       updateNavigation(p, acc);
     },
     [say, updateNavigation],
@@ -636,6 +667,50 @@ export default function EbikeApp() {
     return () => clearInterval(id);
   }, [rideStatus, say, buildRecord]);
 
+  // ───────────── 넘어짐 감지 · SOS ─────────────
+  /** 긴급 안내는 음성 설정과 관계없이 읽음 */
+  const sayUrgent = useCallback((text: string) => {
+    const s = settingsRef.current;
+    speak(text, { rate: s.rate, volume: 1, voiceURI: s.voiceURI }, true);
+  }, []);
+  const openSosScreen = useCallback(() => setSos("sos"), []);
+
+  const showWeather = () => {
+    if (!weather) return;
+    toast.info(
+      `${describeWeather(weather.code).text} ${Math.round(weather.tempC)}°C · ${windName(weather.windFromDeg)} ` +
+        `${weather.windMs.toFixed(1)}m/s (돌풍 ${weather.gustMs.toFixed(0)}) · 3시간 내 비 ${weather.rainChance}%`,
+      { duration: 5000 },
+    );
+  };
+  function openSos(mode: "check" | "sos") {
+    setSos(mode);
+    const p = positionRef.current;
+    if (p) addressOf(p).then(setSosAddress);
+  }
+
+  // ───────────── 배터리 ─────────────
+  const updateBattery = (b: BatteryState) => {
+    saveBattery(b);
+    setBattery(b);
+  };
+
+  // ───────────── 날씨 (15분마다) ─────────────
+  const hasPosition = position !== null;
+  useEffect(() => {
+    if (!hasPosition) return;
+    const load = () => {
+      const p = positionRef.current;
+      if (p)
+        fetchWeather(p)
+          .then(setWeather)
+          .catch((err) => console.warn("날씨 실패", err));
+    };
+    load();
+    const id = setInterval(load, 15 * 60 * 1000);
+    return () => clearInterval(id);
+  }, [hasPosition]);
+
   // ───────────── 주행 제어 ─────────────
   const setRideStatusBoth = (s: RideStatus) => {
     rideStatusRef.current = s;
@@ -646,6 +721,17 @@ export default function EbikeApp() {
     unlockSpeech(); // iOS: 터치 이벤트 안에서 음성 활성화
     startGps();
     acquireWakeLock();
+    if (settingsRef.current.crashDetect && !crashRef.current) {
+      // iOS: 움직임 센서 권한도 터치 이벤트 안에서 요청해야 함
+      requestMotionPermission().then((ok) => {
+        if (!ok) {
+          toast.info("움직임 센서 권한이 없어 넘어짐 감지를 쓸 수 없습니다.");
+          return;
+        }
+        crashRef.current = new CrashDetector(() => openSos("check"));
+        crashRef.current.start();
+      });
+    }
     if (rideStatus === "idle") {
       rideRef.current = { ...EMPTY_RIDE };
       periodicRef.current = { lastTime: 0, lastDistance: 0 };
@@ -681,6 +767,8 @@ export default function EbikeApp() {
     stopNavigation();
     stopGps();
     releaseWakeLock();
+    crashRef.current?.stop();
+    crashRef.current = null;
     persistRide(buildRecord());
   };
 
@@ -813,6 +901,33 @@ export default function EbikeApp() {
     if (destination) computeRoute(destination, null, profile);
   };
 
+  // 배터리: 누적 거리(저장된 주행 + 지금 주행) 기준 추정
+  const odometer =
+    rides.reduce((sum, r) => sum + r.distance, 0) + (rideStatus !== "idle" ? ride.distance : 0);
+  const batteryEst = estimateBattery(battery, odometer);
+  const routeBatteryLeft =
+    batteryEst && route
+      ? batteryEst.percent - ((route.distance / 1000) * battery.whPerKm * 100) / battery.capacityWh
+      : null;
+  const routeWind =
+    weather && route && route.coords.length > 1
+      ? headwind(weather, bearing(route.coords[0], route.coords[route.coords.length - 1]))
+      : null;
+
+  // 배터리 20% · 10% 아래로 내려가면 음성 경고 (주행 중 한 번씩)
+  const lowLevel = batteryEst ? (batteryEst.percent <= 10 ? 10 : batteryEst.percent <= 20 ? 20 : null) : null;
+  useEffect(() => {
+    if (lowLevel === null) {
+      lowBatteryRef.current = null;
+      return;
+    }
+    if (rideStatus !== "riding" || lowBatteryRef.current === lowLevel || !batteryEst) return;
+    lowBatteryRef.current = lowLevel;
+    say(
+      `배터리가 약 ${lowLevel}퍼센트 남았습니다. 약 ${Math.round(batteryEst.rangeKm)}킬로미터 더 갈 수 있습니다.`,
+    );
+  }, [lowLevel, rideStatus, batteryEst, say]);
+
   // 안내 시작 전 예상 시간: 지금 달리는 중이면 현재 속도, 아니면 최근 주행 평균, 없으면 기본 속도
   const recent = rides.slice(0, 10);
   const recentMoving = recent.reduce((t, r) => t + r.movingTime, 0);
@@ -846,6 +961,11 @@ export default function EbikeApp() {
         `${destination.name}까지 길 안내를 시작합니다. 총 ${spokenDistance(route.distance)}${ratio}, ` +
           `약 ${formatEta(planEtaSec)} 걸립니다.`,
       );
+      if (routeBatteryLeft !== null && routeBatteryLeft < 10)
+        say("배터리가 부족할 수 있습니다. 충전 상태를 확인하세요.");
+      if (weather && weather.rainChance >= 50)
+        say(`3시간 안에 비 올 확률 ${weather.rainChance}퍼센트입니다.`);
+      if (routeWind !== null && routeWind >= 4) say("맞바람이 강합니다. 평소보다 느릴 수 있습니다.");
     }
   };
 
@@ -949,9 +1069,22 @@ export default function EbikeApp() {
             <button onClick={() => setSheet("history")} className="font-mono tabular-nums">
               누적 {(totalDistance / 1000).toFixed(1)}km
             </button>
-            <span>
-              {rideStatus === "riding" ? "● 주행 중" : rideStatus === "paused" ? "❚❚ 일시정지" : "대기"}
-            </span>
+            <button onClick={() => setSheet("battery")} className="tabular-nums">
+              {batteryEst
+                ? `🔋${Math.round(batteryEst.percent)}% · ${Math.round(batteryEst.rangeKm)}km`
+                : "🔋 입력"}
+            </button>
+            {weather ? (
+              <button onClick={showWeather} className="tabular-nums">
+                {describeWeather(weather.code).icon}
+                {Math.round(weather.tempC)}° {windName(weather.windFromDeg).replace("풍", "")}
+                {Math.round(weather.windMs)}
+              </button>
+            ) : (
+              <span>
+                {rideStatus === "riding" ? "● 주행 중" : rideStatus === "paused" ? "❚❚ 일시정지" : "대기"}
+              </span>
+            )}
           </div>
           <div className="mt-1 flex items-end justify-center gap-2">
             <span
@@ -1093,6 +1226,14 @@ export default function EbikeApp() {
                   label="속도계 크게 보기"
                   onClick={() => {
                     setBigSpeed(true);
+                    setMenuOpen(false);
+                  }}
+                />
+                <MenuItem
+                  icon="🆘"
+                  label="긴급 SOS"
+                  onClick={() => {
+                    openSos("sos");
                     setMenuOpen(false);
                   }}
                 />
@@ -1306,6 +1447,24 @@ export default function EbikeApp() {
                     {route.source === "brouter" ? "BRouter" : "OSRM 자전거"} 경로 · 예상 시간은 {plan.label},
                     안내 중에는 현재 속도로 실시간 계산
                   </div>
+                  <ul className="mt-2 space-y-1 text-xs">
+                    {routeBatteryLeft !== null && (
+                      <li className={routeBatteryLeft < 10 ? "text-red-300" : "text-slate-300"}>
+                        🔋 도착 시 예상 배터리 {Math.max(0, Math.round(routeBatteryLeft))}%
+                        {routeBatteryLeft < 10 && " — 부족할 수 있어요"}
+                      </li>
+                    )}
+                    {weather && routeWind !== null && (
+                      <li className={routeWind >= 4 ? "text-amber-300" : "text-slate-300"}>
+                        🌬 {windEffectText(routeWind, weather.windMs)}
+                      </li>
+                    )}
+                    {weather && weather.rainChance >= 30 && (
+                      <li className={weather.rainChance >= 50 ? "text-amber-300" : "text-slate-300"}>
+                        ☔ 3시간 안에 비 올 확률 {weather.rainChance}%
+                      </li>
+                    )}
+                  </ul>
                   <button
                     onClick={startNavigation}
                     className="mt-3 w-full rounded-xl bg-emerald-500 py-3 text-lg font-bold text-black"
@@ -1317,6 +1476,48 @@ export default function EbikeApp() {
             </div>
           )}
         </Sheet>
+      )}
+
+      {/* ───── 배터리 시트 ───── */}
+      {sheet === "battery" && (
+        <BatterySheet
+          battery={battery}
+          odometer={odometer}
+          onSetPercent={(pct) => {
+            const next = recordPercent(battery, pct, odometer);
+            updateBattery(next);
+            toast.success(
+              next.learned > battery.learned
+                ? `배터리 ${pct}% 저장 · 소모량 ${next.whPerKm}Wh/km로 학습했습니다`
+                : `배터리 ${pct}% 저장`,
+            );
+            setSheet(null);
+          }}
+          onChange={updateBattery}
+          onClose={() => setSheet(null)}
+        />
+      )}
+
+      {/* ───── 넘어짐 확인 · 긴급 ───── */}
+      {sos && (
+        <SosOverlay
+          mode={sos}
+          position={position}
+          address={sosAddress}
+          contactName={settings.emergencyName}
+          contactPhone={settings.emergencyPhone}
+          say={sayUrgent}
+          onOk={() => {
+            setSos(null);
+            crashRef.current?.reset();
+            say("다행입니다. 안전 운전하세요.", true);
+          }}
+          onSos={openSosScreen}
+          onClose={() => {
+            setSos(null);
+            crashRef.current?.reset();
+          }}
+        />
       )}
 
       {/* ───── 기록 시트 ───── */}
@@ -1474,6 +1675,38 @@ export default function EbikeApp() {
               value={settings.cruiseSpeed}
               onChange={(v) => update("cruiseSpeed", v)}
             />
+          </Section>
+
+          <Section title="안전">
+            <Toggle
+              label="넘어짐 감지 (충격 후 멈추면 확인)"
+              value={settings.crashDetect}
+              onChange={(v) => update("crashDetect", v)}
+            />
+            <Row label="보호자 이름">
+              <input
+                value={settings.emergencyName}
+                onChange={(e) => update("emergencyName", e.target.value)}
+                placeholder="예: 엄마"
+                className="w-40 rounded-lg bg-slate-900 px-2 py-1.5 text-right"
+              />
+            </Row>
+            <Row label="보호자 전화번호">
+              <input
+                value={settings.emergencyPhone}
+                onChange={(e) => update("emergencyPhone", e.target.value)}
+                placeholder="010-0000-0000"
+                inputMode="tel"
+                className="w-40 rounded-lg bg-slate-900 px-2 py-1.5 text-right"
+              />
+            </Row>
+            <button onClick={() => openSos("check")} className="w-full rounded-xl bg-slate-800 py-2 text-sm">
+              넘어짐 알림 미리보기
+            </button>
+            <p className="text-xs text-slate-500">
+              주행 중 강한 충격 뒤 10초 이상 멈춰 있으면 “괜찮으세요?”를 묻고, 30초 동안 응답이 없으면
+              119·보호자 연락 화면을 엽니다. 웹앱은 문자를 자동으로 보낼 수 없어 버튼을 한 번 눌러야 합니다.
+            </p>
           </Section>
 
           <SyncSection code={syncCode} onCodeChange={setSyncCode} onDataChanged={reloadLocalData} />
