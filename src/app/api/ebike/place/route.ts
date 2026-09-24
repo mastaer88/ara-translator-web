@@ -66,7 +66,7 @@ export async function GET(req: Request) {
     }
 
     if (!q) return NextResponse.json({ places: [] });
-    const near = lat !== null && lng !== null ? { x: String(lng), y: String(lat) } : {};
+    const near: Record<string, string> = lat !== null && lng !== null ? { x: String(lng), y: String(lat) } : {};
 
     // 1) 장소 이름 검색 (가게·건물·공원 등)
     const keyword = await kakao<KakaoPlace>("/search/keyword.json", { query: q, size: "10", ...near });

@@ -426,12 +426,14 @@ export default function EbikeApp() {
         const track = trackRef.current;
         const prev = track[track.length - 1];
         if (!prev || haversine({ lat: prev[0], lng: prev[1] }, p) >= 5) {
-          track.push([
+          const point: TrackPoint = [
             Math.round(p.lat * 1e6) / 1e6,
             Math.round(p.lng * 1e6) / 1e6,
             Math.round((t - startedAtRef.current) / 1000),
             Math.round(kmh * 10) / 10,
-          ]);
+          ];
+          if (pos.coords.altitude !== null) point.push(Math.round(pos.coords.altitude * 10) / 10);
+          track.push(point);
         }
 
         // 거리 기준 주기 안내

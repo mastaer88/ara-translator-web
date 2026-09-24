@@ -3,8 +3,8 @@
  * 기록은 이 기기의 Safari 안에만 저장된다.
  */
 
-/** [위도, 경도, 시작 후 경과 초, 속도 km/h] */
-export type TrackPoint = [number, number, number, number];
+/** [위도, 경도, 시작 후 경과 초, 속도 km/h, 고도 m(있을 때만)] */
+export type TrackPoint = [number, number, number, number, number?];
 
 export type RideRecord = {
   id: string;

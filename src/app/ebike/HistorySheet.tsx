@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { formatDistance, formatDuration } from "@/lib/ebike/geo";
 import { computeTotals, type RideRecord } from "@/lib/ebike/rideStore";
+import RideCharts from "./RideCharts";
 import { Sheet, Stat } from "./ui";
 
 type Props = {
@@ -84,6 +85,7 @@ export default function HistorySheet(props: Props) {
                     <div>도착: {r.endName ?? "-"} ({new Date(r.endedAt).toLocaleTimeString("ko-KR")})</div>
                     <div>주행(이동) 시간: {formatDuration(r.movingTime)}</div>
                   </dl>
+                  <RideCharts ride={r} />
                   <div className="mt-3 grid grid-cols-2 gap-2 text-sm">
                     <button className="rounded-lg bg-violet-600 py-2 font-semibold" onClick={() => props.onView(r)}>
                       🗺 지도에서 보기
