@@ -314,3 +314,27 @@ export async function findBikeRoute(from: LatLng, to: LatLng, profile: RouteProf
     return await routeWithOsrm(from, to, profile);
   }
 }
+
+/** 좌표의 전체 주소 (위치 정보 조회용) */
+export async function addressOf(p: LatLng): Promise<string | null> {
+  try {
+    const params = new URLSearchParams({
+      lat: String(p.lat),
+      lon: String(p.lng),
+      format: "jsonv2",
+      zoom: "18",
+      "accept-language": "ko",
+    });
+    const data = (await fetchJson(
+      `https://nominatim.openstreetmap.org/reverse?${params}`,
+    )) as NominatimItem;
+    // Nominatim은 "번지, 도로, 동, 구, 시, 우편번호, 국가" 순서 → 한국식으로 뒤집음
+    const parts = data.display_name
+      .split(",")
+      .map((s) => s.trim())
+      .filter((s) => s && s !== "대한민국" && !/^\d{5}$/.test(s));
+    return parts.reverse().join(" ");
+  } catch {
+    return null;
+  }
+}
