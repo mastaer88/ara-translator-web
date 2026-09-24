@@ -53,8 +53,22 @@ Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/bui
 
 웹앱이라 화면이 꺼지거나 다른 앱으로 전환하면 위치 추적·음성 안내가 멈춥니다.
 
-### 여러 기기 동기화 설정 (한 번만)
+### 기록을 PC에 저장하기 (동기화)
 
-Vercel 대시보드 → 프로젝트 → **Storage** → **Create Database** → **Upstash for Redis**(무료)를 만들고
-이 프로젝트에 연결한 뒤 다시 배포하세요. `KV_REST_API_URL`, `KV_REST_API_TOKEN` 환경변수가 자동으로 추가되며,
-`/api/ebike/sync`가 이를 사용합니다. (`UPSTASH_REDIS_REST_URL`/`UPSTASH_REDIS_REST_TOKEN` 이름도 지원)
+PC에서 서버(`dev.bat`)가 켜져 있으면 동기화한 주행 기록이 PC에 저장됩니다.
+
+- 데이터베이스: `data/app.db` (번역기와 같은 파일, `ebike_sync_*` 테이블)
+- GPX 파일: `data/ebike-gpx/` (주행마다 한 개, Strava·Garmin 등에서 열 수 있음)
+
+아이폰(Vercel 주소)에서 PC에 접속하려면 **https 주소**가 필요합니다. 가장 쉬운 방법은 Tailscale(무료)입니다.
+
+1. PC와 아이폰에 Tailscale을 설치하고 같은 계정으로 로그인
+2. Tailscale 관리 화면 → DNS에서 **MagicDNS**와 **HTTPS Certificates** 켜기
+3. PC에서 `dev.bat` 실행 후, 명령 프롬프트에서 `tailscale serve --bg 3000`
+4. 나오는 `https://<PC이름>.<tailnet>.ts.net` 주소를 앱 **설정 → 기록 저장 PC 주소**에 입력 → 저장·확인
+
+PC가 꺼져 있거나 아이폰의 Tailscale이 꺼져 있으면 기록은 폰에 남아 있다가 다음 동기화 때 올라갑니다.
+PC 브라우저에서 `http://localhost:3000/ebike`를 열고 같은 동기화 코드를 입력하면 PC에서도 기록을 볼 수 있습니다.
+
+(선택) PC 대신 온라인에 저장하려면 Vercel → Storage → **Upstash for Redis**를 연결하세요.
+`KV_REST_API_URL`/`KV_REST_API_TOKEN`이 설정되면 그 서버는 Redis에 저장합니다.
