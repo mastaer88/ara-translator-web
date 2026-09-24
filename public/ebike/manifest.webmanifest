@@ -1,0 +1,17 @@
+{
+  "name": "E-Bike 속도계 · 내비",
+  "short_name": "E-Bike",
+  "description": "전기자전거 속도계, 음성 안내, 자전거도로 우선 길찾기",
+  "start_url": "/ebike",
+  "scope": "/ebike",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#0b1220",
+  "theme_color": "#0b1220",
+  "lang": "ko",
+  "icons": [
+    { "src": "/ebike/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "/ebike/icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "/ebike/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
