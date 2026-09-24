@@ -12,10 +12,18 @@ declare global {
   var __db: Database.Database | undefined;
 }
 
-const db = global.__db ?? new Database(dbPath);
+// 빌드 시 여러 워커가 동시에 DB를 열 수 있으므로 잠금 대기 시간을 넉넉히 둔다
+const db = global.__db ?? new Database(dbPath, { timeout: 15000 });
 if (process.env.NODE_ENV !== "production") global.__db = db;
 
-db.pragma("journal_mode = WAL");
+// 저널 모드 변경은 다른 연결이 있으면 즉시 SQLITE_BUSY가 나므로 필요할 때만 바꾼다
+if (db.pragma("journal_mode", { simple: true }) !== "wal") {
+  try {
+    db.pragma("journal_mode = WAL");
+  } catch (err) {
+    console.warn("WAL 모드 전환 실패 (다른 연결이 사용 중):", err);
+  }
+}
 db.pragma("foreign_keys = ON");
 
 db.exec(`

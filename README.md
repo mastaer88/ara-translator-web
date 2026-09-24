@@ -34,3 +34,17 @@ You can check out [the Next.js GitHub repository](https://github.com/vercel/next
 The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
 
 Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+
+## 전기자전거 속도계 · 내비 (`/ebike`)
+
+아이폰 Safari에서 `https://<서버주소>/ebike` 접속 → 공유 → **홈 화면에 추가** 하면 앱처럼 사용할 수 있습니다.
+(위치 권한은 HTTPS 에서만 동작합니다.)
+
+- **속도계**: GPS 실시간 속도, 주행 거리·시간·평균·최고 속도, 주행 중 화면 꺼짐 방지
+- **음성 안내**: 시간/거리 주기 속도 안내, 제한 속도(기본 25km/h) 초과 경고, 목소리·속도·음량 설정
+- **지도**: OpenStreetMap + CyclOSM 자전거도로 레이어, 내 위치 따라가기
+- **길찾기**: 장소 검색 또는 지도에서 선택 → BRouter 자전거 경로
+  (자전거도로 우선 / 균형 / 빠른 길), 경로의 자전거도로 비율 표시,
+  회전 음성 안내, 경로 이탈 시 자동 재탐색 (BRouter 실패 시 OSRM 자전거 경로 사용)
+
+웹앱이라 화면이 꺼지거나 다른 앱으로 전환하면 위치 추적·음성 안내가 멈춥니다.

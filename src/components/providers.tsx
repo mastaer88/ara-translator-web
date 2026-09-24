@@ -10,7 +10,6 @@ export function ToasterProvider() {
       theme="light"
       expand={true}
       closeButton
-      pauseWhenPageIsHidden
     />
   );
 }
