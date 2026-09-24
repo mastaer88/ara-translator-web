@@ -9,22 +9,22 @@ export async function detectLanguage(text: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const scriptPath = path.join(process.cwd(), "scripts", "detect_language.py");
 
-    const process = spawn("python3", [scriptPath, text], {
+    const child = spawn("python3", [scriptPath, text], {
       timeout: 10000,
     });
 
     let output = "";
     let errorOutput = "";
 
-    process.stdout.on("data", (data) => {
+    child.stdout.on("data", (data) => {
       output += data.toString();
     });
 
-    process.stderr.on("data", (data) => {
+    child.stderr.on("data", (data) => {
       errorOutput += data.toString();
     });
 
-    process.on("close", (code) => {
+    child.on("close", (code) => {
       if (code === 0) {
         try {
           const result = JSON.parse(output);
@@ -44,7 +44,7 @@ export async function detectLanguage(text: string): Promise<string> {
       }
     });
 
-    process.on("error", (err) => {
+    child.on("error", (err) => {
       console.error("Language detection process error:", err);
       resolve("ja");
     });

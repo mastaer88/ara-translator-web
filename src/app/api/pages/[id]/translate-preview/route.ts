@@ -12,9 +12,9 @@ const uploadsDir = path.join(process.cwd(), "uploads");
  */
 export async function GET(
   req: NextRequest,
-  { params }: { params: { id: string } }
+  { params }: { params: Promise<{ id: string }> }
 ) {
-  const pageId = params.id;
+  const { id: pageId } = await params;
   const quality = req.nextUrl.searchParams.get("quality") || "85";
 
   try {

@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import db from "@/lib/db";
-import { runOcr } from "@/lib/ocr";
+import { runOcr, type OcrRegion } from "@/lib/ocr";
 import { randomUUID } from "crypto";
 import path from "path";
 
@@ -36,7 +36,7 @@ export async function POST(req: NextRequest) {
      VALUES (?, ?, ?, 'ocr', 'running', 0, ?, ?)`
   ).run(jobId, page.project_id, pageId, now, now);
 
-  let regions;
+  let regions: OcrRegion[];
   try {
     regions = await runOcr(imagePath, project.source_lang);
 
