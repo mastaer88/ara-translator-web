@@ -73,6 +73,7 @@ import {
 import { getKoreanVoices, isSpeechSupported, speak, unlockSpeech } from "@/lib/ebike/voice";
 import { loadSettings, saveSettings, type EbikeSettings } from "./settings";
 import BatterySheet from "./BatterySheet";
+import Onboarding, { markOnboarded, shouldShowOnboarding } from "./Onboarding";
 import HistorySheet from "./HistorySheet";
 import SosOverlay from "./SosOverlay";
 import ParkingSheet from "./ParkingSheet";
@@ -201,6 +202,7 @@ export default function EbikeApp() {
   const [follow, setFollow] = useState(true);
   const [locating, setLocating] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
+  const [onboarding, setOnboarding] = useState(shouldShowOnboarding);
   const [bigSpeed, setBigSpeed] = useState(false);
   const [night, setNight] = useState(() => isNight());
   const [battery, setBattery] = useState<BatteryState>(loadBattery);
@@ -1587,6 +1589,26 @@ export default function EbikeApp() {
         </Sheet>
       )}
 
+      {/* ───── 처음 사용 안내 ───── */}
+      {onboarding && (
+        <Onboarding
+          onDone={() => {
+            markOnboarded();
+            setOnboarding(false);
+          }}
+          onOpenBattery={() => {
+            markOnboarded();
+            setOnboarding(false);
+            setSheet("battery");
+          }}
+          onOpenSettings={() => {
+            markOnboarded();
+            setOnboarding(false);
+            setSheet("settings");
+          }}
+        />
+      )}
+
       {/* ───── 배터리 시트 ───── */}
       {sheet === "battery" && (
         <BatterySheet
@@ -1849,6 +1871,15 @@ export default function EbikeApp() {
             </Row>
           </Section>
 
+          <button
+            onClick={() => {
+              setSheet(null);
+              setOnboarding(true);
+            }}
+            className="mt-2 w-full rounded-xl bg-slate-800 py-2 text-sm"
+          >
+            📖 사용 안내 다시 보기
+          </button>
           <p className="mt-2 text-xs leading-relaxed text-slate-500">
             아이폰 사용 팁: Safari 공유 버튼 → “홈 화면에 추가”로 앱처럼 쓸 수 있습니다. 웹앱 특성상 화면이
             꺼지거나 다른 앱으로 전환하면 위치 추적과 음성 안내가 멈추므로, 핸들 거치대에 두고 화면을 켠
