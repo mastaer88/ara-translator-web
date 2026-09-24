@@ -37,7 +37,7 @@ export function MapButton({
       onClick={onClick}
       aria-label={label}
       title={label}
-      className={`h-12 w-12 rounded-full text-xl shadow-lg ${
+      className={`h-14 w-14 rounded-full text-2xl shadow-lg active:scale-95 transition-transform ${
         active ? "bg-blue-600 text-white" : "bg-white text-slate-700"
       }`}
     >

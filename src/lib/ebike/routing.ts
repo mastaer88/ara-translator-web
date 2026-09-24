@@ -48,7 +48,7 @@ export type Route = {
   profile: RouteProfile;
 };
 
-export type Place = { name: string; detail: string; location: LatLng };
+export type Place = { name: string; detail: string; location: LatLng; distance?: number | null };
 
 const TURN_TEXT: Record<TurnType, string> = {
   straight: "직진",
@@ -89,7 +89,43 @@ async function fetchJson(url: string, signal?: AbortSignal, timeoutMs = 20000): 
 
 type NominatimItem = { lat: string; lon: string; display_name: string; name?: string };
 
+// ───────────── 카카오 로컬 (서버에 키가 있을 때) → 없으면 OpenStreetMap ─────────────
+
+/** 카카오 사용 가능 여부 (503을 한 번 받으면 이후 바로 OpenStreetMap 사용) */
+let kakaoAvailable: boolean | null = null;
+
+async function kakaoPlace<T>(params: Record<string, string>): Promise<T | null> {
+  if (kakaoAvailable === false) return null;
+  try {
+    const res = await fetch(`/api/ebike/place?${new URLSearchParams(params)}`);
+    if (res.status === 503) {
+      kakaoAvailable = false;
+      return null;
+    }
+    if (!res.ok) return null;
+    kakaoAvailable = true;
+    return (await res.json()) as T;
+  } catch {
+    return null;
+  }
+}
+
 export async function searchPlaces(query: string, near?: LatLng | null): Promise<Place[]> {
+  const kakao = await kakaoPlace<{ places: { name: string; detail: string; lat: number; lng: number; distance: number | null }[] }>(
+    { q: query, ...(near ? { lat: String(near.lat), lng: String(near.lng) } : {}) },
+  );
+  if (kakao) {
+    return kakao.places.map((p) => ({
+      name: p.name,
+      detail: p.detail,
+      location: { lat: p.lat, lng: p.lng },
+      distance: p.distance,
+    }));
+  }
+  return searchNominatim(query, near);
+}
+
+async function searchNominatim(query: string, near?: LatLng | null): Promise<Place[]> {
   const params = new URLSearchParams({
     q: query,
     format: "jsonv2",
@@ -115,6 +151,8 @@ export async function searchPlaces(query: string, near?: LatLng | null): Promise
 }
 
 export async function reverseGeocode(p: LatLng): Promise<string> {
+  const kakao = await kakaoPlace<{ name: string | null }>({ lat: String(p.lat), lng: String(p.lng), reverse: "1" });
+  if (kakao?.name) return kakao.name;
   try {
     const params = new URLSearchParams({
       lat: String(p.lat),
@@ -317,6 +355,8 @@ export async function findBikeRoute(from: LatLng, to: LatLng, profile: RouteProf
 
 /** 좌표의 전체 주소 (위치 정보 조회용) */
 export async function addressOf(p: LatLng): Promise<string | null> {
+  const kakao = await kakaoPlace<{ address: string | null }>({ lat: String(p.lat), lng: String(p.lng), reverse: "1" });
+  if (kakao?.address) return kakao.address;
   try {
     const params = new URLSearchParams({
       lat: String(p.lat),

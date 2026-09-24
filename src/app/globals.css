@@ -94,3 +94,18 @@ body {
 .zoom-in-95 {
   animation: zoom-in-95 0.3s ease-out;
 }
+
+/* 전기자전거 야간 지도: 밝은 지도 타일을 어둡게 반전 */
+.ebike-map-dark .leaflet-tile-pane {
+  filter: invert(1) hue-rotate(180deg) brightness(0.85) contrast(0.9) saturate(0.8);
+}
+.ebike-map-dark .leaflet-container {
+  background: #1a1f29 !important;
+}
+.ebike-map-dark .leaflet-container .leaflet-control-attribution {
+  background: rgba(15, 23, 42, 0.7);
+  color: #94a3b8;
+}
+.ebike-map-dark .leaflet-container .leaflet-control-attribution a {
+  color: #93c5fd;
+}

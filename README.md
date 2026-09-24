@@ -53,6 +53,16 @@ Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/bui
 
 웹앱이라 화면이 꺼지거나 다른 앱으로 전환하면 위치 추적·음성 안내가 멈춥니다.
 
+- **안전·편의**: 야간 지도 자동 전환, 진행 방향 위 지도, 속도계 크게 보기·가로 모드, 회전 지점 진행 막대,
+  배터리 잔량·주행 가능 거리(소모량 자동 학습), 날씨·맞바람 안내, 넘어짐 감지·긴급 SOS, 주행 그래프·1km 구간 기록
+
+### 카카오 장소 검색 (선택)
+
+[Kakao Developers](https://developers.kakao.com)에서 애플리케이션을 만들고 **REST API 키**를 받아
+Vercel → 프로젝트 → Settings → Environment Variables에 `KAKAO_REST_API_KEY`로 넣고 다시 배포하세요
+(PC 서버는 `.env.local`). 앱 설정에서 **카카오맵 → 사용 설정 ON**이 필요합니다.
+키가 없으면 OpenStreetMap 검색을 사용합니다.
+
 ### 기록을 PC에 저장하기 (동기화)
 
 PC에서 서버(`dev.bat`)가 켜져 있으면 동기화한 주행 기록이 PC에 저장됩니다.
