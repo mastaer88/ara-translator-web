@@ -45,7 +45,11 @@ const MapView = dynamic(() => import("./MapView"), { ssr: false });
 type RideStatus = "idle" | "riding" | "paused";
 type GpsStatus = "off" | "waiting" | "on" | "error";
 type Destination = { name: string; location: LatLng };
-type NavProgress = { remaining: number; next: Maneuver | null; distToNext: number };
+type NavProgress = {
+  remaining: number;
+  next: Maneuver | null;
+  distToNext: number;
+};
 
 /** 정확도가 이보다 나쁜 위치는 거리 누적에서 제외 (m) */
 const MAX_ACCURACY = 35;
@@ -110,7 +114,7 @@ export default function EbikeApp() {
     route: null as Route | null,
     destination: null as Destination | null,
     navigating: false,
-    announced: new Map<number, Set<"far" | "near">>(),
+    announced: new Map<number, Set<"straight" | "far" | "near">>(),
     offCount: 0,
     lastReroute: 0,
     rerouting: false,
@@ -119,6 +123,7 @@ export default function EbikeApp() {
   // 화면
   const [sheet, setSheet] = useState<"nav" | "settings" | "history" | "location" | null>(null);
   const [follow, setFollow] = useState(true);
+  const [locating, setLocating] = useState(false);
   const [pickMode, setPickMode] = useState(false);
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<Place[]>([]);
@@ -239,9 +244,15 @@ export default function EbikeApp() {
           nav.rerouting = true;
           nav.lastReroute = now;
           if (settingsRef.current.navVoice) say("경로를 벗어났습니다. 경로를 다시 탐색합니다.", true);
-          computeRoute(nav.destination, p).finally(() => {
-            nav.rerouting = false;
-          });
+          computeRoute(nav.destination, p)
+            .then((newRoute) => {
+              if (newRoute && nav.navigating && settingsRef.current.navVoice) {
+                say(`새 경로로 안내합니다. 목적지까지 ${spokenDistance(newRoute.distance)}입니다.`);
+              }
+            })
+            .finally(() => {
+              nav.rerouting = false;
+            });
         }
       } else {
         nav.offCount = 0;
@@ -261,15 +272,30 @@ export default function EbikeApp() {
       const distToNext = next ? next.distAlong - proj.distAlong : remaining;
       setProgress({ remaining, next, distToNext });
 
-      if (!next || next.type === "arrive" || !settingsRef.current.navVoice) return;
+      if (!next || !settingsRef.current.navVoice) return;
       const stages = nav.announced.get(idx) ?? new Set();
       nav.announced.set(idx, stages);
+
+      if (next.type === "arrive") {
+        if (distToNext <= 120 && !stages.has("near")) {
+          stages.add("near").add("far").add("straight");
+          say("잠시 후 목적지에 도착합니다.");
+        } else if (distToNext > 400 && !stages.has("straight")) {
+          stages.add("straight");
+          say(`목적지까지 ${spokenDistance(distToNext)} 직진입니다.`);
+        }
+        return;
+      }
       if (distToNext <= 60 && !stages.has("near")) {
-        stages.add("near").add("far");
+        stages.add("near").add("far").add("straight");
         say(`잠시 후 ${next.text}`, true);
       } else if (distToNext <= 250 && distToNext > 90 && !stages.has("far")) {
-        stages.add("far");
+        stages.add("far").add("straight");
         say(`${spokenDistance(distToNext)} 앞에서 ${next.text}`);
+      } else if (distToNext > 400 && !stages.has("straight")) {
+        // 회전 직후 다음 안내까지 멀면 직진 거리를 알려줌
+        stages.add("straight");
+        say(`${spokenDistance(distToNext)} 직진 후 ${next.text}`);
       }
     },
     [computeRoute, say, stopNavigation],
@@ -342,7 +368,7 @@ export default function EbikeApp() {
         const now = Date.now();
         if (overSpeedRef.current.count >= 2 && now - overSpeedRef.current.lastWarn > 15000) {
           overSpeedRef.current.lastWarn = now;
-          say(`속도를 줄이세요. 현재 시속 ${Math.round(kmh)}킬로미터입니다.`, true);
+          say(`속도를 줄이세요. 현재 시속 ${Math.round(kmh)}킬로미터입니다.`);
         }
       } else {
         overSpeedRef.current.count = 0;
@@ -372,7 +398,9 @@ export default function EbikeApp() {
       (err) => {
         if (err.code === err.PERMISSION_DENIED) {
           setGpsStatus("error");
-          toast.error("위치 권한이 거부되었습니다. 설정 > 개인정보 보호 > 위치 서비스 > Safari에서 허용해 주세요.");
+          toast.error(
+            "위치 권한이 거부되었습니다. 설정 > 개인정보 보호 > 위치 서비스 > Safari에서 허용해 주세요.",
+          );
         } else {
           // 시간 초과·일시적 수신 불가(정차, 터널 등)는 감시가 계속되므로 상태만 표시
           setGpsStatus("waiting");
@@ -573,7 +601,10 @@ export default function EbikeApp() {
     if (!end) return;
     setViewing(null);
     setSheet("nav");
-    chooseDestination({ name: r.endName ?? "지난 주행 도착지", location: { lat: end[0], lng: end[1] } });
+    chooseDestination({
+      name: r.endName ?? "지난 주행 도착지",
+      location: { lat: end[0], lng: end[1] },
+    });
   };
 
   const changeProfile = (profile: RouteProfile) => {
@@ -592,20 +623,82 @@ export default function EbikeApp() {
     setSheet(null);
     const ratio =
       route.cyclewayRatio !== null ? `, 자전거도로 비율 ${Math.round(route.cyclewayRatio * 100)}퍼센트` : "";
-    if (settingsRef.current.navVoice) {
-      say(`${destination.name}까지 길 안내를 시작합니다. 총 ${spokenDistance(route.distance)}${ratio}입니다.`);
+    const s = settingsRef.current;
+    if (!s.voiceEnabled || !s.navVoice) {
+      toast.warning("음성 안내가 꺼져 있습니다. 설정에서 '음성 안내 사용'과 '길 안내 음성'을 켜 주세요.");
+    }
+    if (s.navVoice) {
+      say(
+        `${destination.name}까지 길 안내를 시작합니다. 총 ${spokenDistance(route.distance)}${ratio}입니다.`,
+      );
     }
   };
+
+  /** 안내 배너를 누르면 현재 안내를 다시 읽어줌 */
+  const repeatInstruction = () => {
+    if (!progress) return;
+    unlockSpeech();
+    const { next, distToNext } = progress;
+    if (!next || next.type === "arrive") {
+      say(`목적지까지 ${spokenDistance(distToNext)} 남았습니다.`, true);
+    } else {
+      say(
+        `${spokenDistance(distToNext)} 앞에서 ${next.text}. 목적지까지 ${spokenDistance(progress.remaining)}`,
+        true,
+      );
+    }
+  };
+
+  // ───────────── 현재 위치 찾기 ─────────────
+  const locateMe = useCallback(() => {
+    setFollow(true);
+    // 주행 중이면 GPS가 이미 켜져 있으므로 지도만 내 위치로 이동
+    if (watchIdRef.current !== null && positionRef.current) return;
+    if (!("geolocation" in navigator)) return;
+    setLocating(true);
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        const p = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+        positionRef.current = p;
+        setPosition(p);
+        setAccuracy(pos.coords.accuracy);
+        setLocating(false);
+      },
+      (err) => {
+        setLocating(false);
+        toast.error(
+          err.code === err.PERMISSION_DENIED
+            ? "위치 권한이 거부되었습니다. 설정 > 개인정보 보호 > 위치 서비스 > Safari 웹 사이트에서 허용해 주세요."
+            : "현재 위치를 찾지 못했습니다. 잠시 후 다시 시도해 주세요.",
+        );
+      },
+      { enableHighAccuracy: true, timeout: 15000, maximumAge: 5000 },
+    );
+  }, []);
+
+  // 앱을 열면 바로 현재 위치로 지도 이동 (실패해도 조용히 넘어감)
+  useEffect(() => {
+    if (!("geolocation" in navigator)) return;
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        if (watchIdRef.current !== null) return; // 이미 주행 GPS가 켜짐
+        const p = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+        positionRef.current = p;
+        setPosition(p);
+        setAccuracy(pos.coords.accuracy);
+      },
+      () => {},
+      { enableHighAccuracy: true, timeout: 15000, maximumAge: 30000 },
+    );
+  }, []);
 
   // ───────────── 표시 값 ─────────────
   const avgSpeed = ride.movingTime > 0 ? (ride.distance / ride.movingTime) * 3.6 : 0;
   const cruiseMs = (settings.cruiseSpeed * 1000) / 3600;
   const displaySpeed = Math.round(speed);
-  const totalDistance = rides.reduce((sum, r) => sum + r.distance, 0) + (rideStatus !== "idle" ? ride.distance : 0);
-  const viewingTrack = useMemo(
-    () => viewing?.points.map(([lat, lng]) => ({ lat, lng })) ?? null,
-    [viewing],
-  );
+  const totalDistance =
+    rides.reduce((sum, r) => sum + r.distance, 0) + (rideStatus !== "idle" ? ride.distance : 0);
+  const viewingTrack = useMemo(() => viewing?.points.map(([lat, lng]) => ({ lat, lng })) ?? null, [viewing]);
   const limitRatio = Math.min(1, speed / Math.max(1, settings.speedLimit * 1.2));
 
   return (
@@ -662,16 +755,23 @@ export default function EbikeApp() {
 
         {navigating && progress && (
           <div className="absolute inset-x-3 top-3 z-[1000] flex items-center gap-3 rounded-2xl bg-emerald-700/95 p-3 shadow-lg">
-            <div className="w-14 text-center text-5xl leading-none">
-              {TURN_ICON[progress.next?.type ?? "straight"]}
-            </div>
-            <div className="min-w-0 flex-1">
-              <div className="text-2xl font-bold">{formatDistance(progress.distToNext)}</div>
-              <div className="truncate text-base">{progress.next?.text ?? "직진"}</div>
-              <div className="text-xs text-emerald-100">
-                남은 거리 {formatDistance(progress.remaining)} · 약 {formatEta(progress.remaining / cruiseMs)}
+            <button
+              onClick={repeatInstruction}
+              className="flex min-w-0 flex-1 items-center gap-3 text-left"
+              aria-label="안내 다시 듣기"
+            >
+              <div className="w-14 text-center text-5xl leading-none">
+                {TURN_ICON[progress.next?.type ?? "straight"]}
               </div>
-            </div>
+              <div className="min-w-0 flex-1">
+                <div className="text-2xl font-bold">{formatDistance(progress.distToNext)}</div>
+                <div className="truncate text-base">{progress.next?.text ?? "직진"}</div>
+                <div className="text-xs text-emerald-100">
+                  남은 거리 {formatDistance(progress.remaining)} · 약{" "}
+                  {formatEta(progress.remaining / cruiseMs)} · 🔊 다시 듣기
+                </div>
+              </div>
+            </button>
             <button
               onClick={stopNavigation}
               className="rounded-xl bg-black/30 px-3 py-2 text-sm"
@@ -719,8 +819,15 @@ export default function EbikeApp() {
           <MapButton active={false} onClick={() => setSheet("location")} label="내 위치 정보">
             ℹ︎
           </MapButton>
-          <MapButton active={follow} onClick={() => setFollow(true)} label="내 위치 따라가기">
-            ◎
+          <MapButton active={follow} onClick={() => locateMe()} label="현재 위치 찾기">
+            <svg
+              viewBox="0 0 24 24"
+              className={`mx-auto h-6 w-6 ${locating ? "animate-pulse" : ""}`}
+              fill="currentColor"
+              aria-hidden
+            >
+              <path d="M21 3 3 10.5l7.2 2.3L12.5 20z" />
+            </svg>
           </MapButton>
         </div>
       </main>
@@ -748,7 +855,10 @@ export default function EbikeApp() {
           <BigButton className="bg-blue-600" onClick={() => setSheet(sheet === "nav" ? null : "nav")}>
             길찾기
           </BigButton>
-          <BigButton className="bg-violet-600" onClick={() => setSheet(sheet === "history" ? null : "history")}>
+          <BigButton
+            className="bg-violet-600"
+            onClick={() => setSheet(sheet === "history" ? null : "history")}
+          >
             기록
           </BigButton>
           <BigButton
@@ -893,8 +1003,14 @@ export default function EbikeApp() {
       {sheet === "settings" && (
         <Sheet title="설정" onClose={() => setSheet(null)}>
           <Section title="음성 안내">
-            <Toggle label="음성 안내 사용" value={settings.voiceEnabled} onChange={(v) => update("voiceEnabled", v)} />
-            {!isSpeechSupported() && <p className="text-xs text-red-400">이 브라우저는 음성 합성을 지원하지 않습니다.</p>}
+            <Toggle
+              label="음성 안내 사용"
+              value={settings.voiceEnabled}
+              onChange={(v) => update("voiceEnabled", v)}
+            />
+            {!isSpeechSupported() && (
+              <p className="text-xs text-red-400">이 브라우저는 음성 합성을 지원하지 않습니다.</p>
+            )}
             <Toggle label="길 안내 음성" value={settings.navVoice} onChange={(v) => update("navVoice", v)} />
             <Row label="주기적 속도 안내">
               <select
@@ -953,8 +1069,22 @@ export default function EbikeApp() {
                 </select>
               </Row>
             )}
-            <Slider label="말하기 속도" min={0.6} max={1.6} step={0.1} value={settings.rate} onChange={(v) => update("rate", v)} />
-            <Slider label="음량" min={0.2} max={1} step={0.1} value={settings.volume} onChange={(v) => update("volume", v)} />
+            <Slider
+              label="말하기 속도"
+              min={0.6}
+              max={1.6}
+              step={0.1}
+              value={settings.rate}
+              onChange={(v) => update("rate", v)}
+            />
+            <Slider
+              label="음량"
+              min={0.2}
+              max={1}
+              step={0.1}
+              value={settings.volume}
+              onChange={(v) => update("volume", v)}
+            />
             <button
               onClick={() => {
                 unlockSpeech();
@@ -967,7 +1097,11 @@ export default function EbikeApp() {
           </Section>
 
           <Section title="속도">
-            <Toggle label="속도 초과 경고" value={settings.speedWarn} onChange={(v) => update("speedWarn", v)} />
+            <Toggle
+              label="속도 초과 경고"
+              value={settings.speedWarn}
+              onChange={(v) => update("speedWarn", v)}
+            />
             <Slider
               label={`제한 속도 ${settings.speedLimit}km/h`}
               min={10}
@@ -987,8 +1121,16 @@ export default function EbikeApp() {
           </Section>
 
           <Section title="화면">
-            <Toggle label="주행 중 화면 켜짐 유지" value={settings.keepAwake} onChange={(v) => update("keepAwake", v)} />
-            <Toggle label="자전거도로 지도 표시" value={settings.cycleLayer} onChange={(v) => update("cycleLayer", v)} />
+            <Toggle
+              label="주행 중 화면 켜짐 유지"
+              value={settings.keepAwake}
+              onChange={(v) => update("keepAwake", v)}
+            />
+            <Toggle
+              label="자전거도로 지도 표시"
+              value={settings.cycleLayer}
+              onChange={(v) => update("cycleLayer", v)}
+            />
           </Section>
 
           <p className="mt-2 text-xs leading-relaxed text-slate-500">

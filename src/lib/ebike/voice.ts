@@ -30,10 +30,12 @@ export function unlockSpeech() {
   unlocked = true;
 }
 
+// Safari는 재생 중인 발화 객체가 가비지 컬렉션되면 소리가 끊기므로 끝날 때까지 참조를 유지한다
+const pending = new Set<SpeechSynthesisUtterance>();
+
 export function speak(text: string, opts: VoiceOptions, interrupt = false) {
   const s = synth();
   if (!s) return;
-  if (interrupt) s.cancel();
   const u = new SpeechSynthesisUtterance(text);
   u.lang = "ko-KR";
   u.rate = opts.rate;
@@ -41,5 +43,16 @@ export function speak(text: string, opts: VoiceOptions, interrupt = false) {
   const voices = getKoreanVoices();
   const voice = voices.find((v) => v.voiceURI === opts.voiceURI) ?? voices[0];
   if (voice) u.voice = voice;
-  s.speak(u);
+  pending.add(u);
+  u.onend = u.onerror = () => pending.delete(u);
+
+  // 백그라운드에서 돌아온 뒤 일시정지 상태로 남아 있는 경우가 있음 (iOS)
+  if (s.paused) s.resume();
+  if (interrupt && (s.speaking || s.pending)) {
+    s.cancel();
+    // iOS Safari는 cancel() 직후 바로 speak()하면 무시하는 경우가 있어 잠깐 기다린다
+    setTimeout(() => s.speak(u), 120);
+  } else {
+    s.speak(u);
+  }
 }
