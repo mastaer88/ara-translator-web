@@ -19,11 +19,19 @@ type Props = {
   /** 값이 바뀔 때마다 지도를 이 위치로 이동 */
   focus: { p: LatLng; key: number } | null;
   follow: boolean;
+  /** 야간 지도 (타일 색 반전) */
+  dark: boolean;
+  /** 진행 방향이 위로 오도록 지도 회전 */
+  headingUp: boolean;
+  /** 속도계 크게 보기 등으로 지도가 숨겨져 있음 */
+  hidden: boolean;
   cycleLayer: boolean;
   pickMode: boolean;
   onPick: (p: LatLng) => void;
   onUserPan: () => void;
 };
+
+type RotatableMap = Leaflet.Map & { setBearing?: (deg: number) => void };
 
 const DEFAULT_CENTER: LatLng = { lat: 37.5665, lng: 126.978 }; // 서울시청
 
@@ -41,7 +49,8 @@ function positionIcon(L: typeof Leaflet, heading: number | null) {
 }
 
 export default function MapView(props: Props) {
-  const { position, heading, accuracy, route, destination, track, parking, focus, follow, cycleLayer } = props;
+  const { position, heading, accuracy, route, destination, track, parking, focus, follow, cycleLayer, dark, headingUp } =
+    props;
   const containerRef = useRef<HTMLDivElement>(null);
   const LRef = useRef<typeof Leaflet | null>(null);
   const mapRef = useRef<Leaflet.Map | null>(null);
@@ -62,16 +71,23 @@ export default function MapView(props: Props) {
   // 지도 초기화
   useEffect(() => {
     let cancelled = false;
-    import("leaflet").then((mod) => {
+    (async () => {
+      const L = (await import("leaflet")).default;
+      // 회전 플러그인은 전역 L을 확장하므로 먼저 등록
+      (window as unknown as { L: typeof Leaflet }).L = L;
+      await import("leaflet-rotate/dist/leaflet-rotate.js");
       if (cancelled || !containerRef.current || mapRef.current) return;
-      const L = mod.default;
       LRef.current = L;
       const map = L.map(containerRef.current, {
         center: [DEFAULT_CENTER.lat, DEFAULT_CENTER.lng],
         zoom: 13,
         zoomControl: false,
         attributionControl: true,
-      });
+        rotate: true,
+        touchRotate: false,
+        rotateControl: false,
+        bearing: 0,
+      } as Leaflet.MapOptions);
       L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
         maxZoom: 19,
         attribution: "&copy; OpenStreetMap",
@@ -90,7 +106,7 @@ export default function MapView(props: Props) {
       });
       mapRef.current = map;
       setReady(true);
-    });
+    })();
     return () => {
       cancelled = true;
       mapRef.current?.remove();
@@ -133,6 +149,19 @@ export default function MapView(props: Props) {
       accCircleRef.current?.setLatLng(ll).setRadius(accuracy ?? 0);
     }
   }, [ready, position, heading, accuracy]);
+
+  // 숨겨졌다가 다시 보일 때 지도 크기 재계산
+  useEffect(() => {
+    if (!ready || props.hidden) return;
+    mapRef.current?.invalidateSize();
+  }, [ready, props.hidden]);
+
+  // 진행 방향이 위로: 지도를 -heading 만큼 회전 (위치 화살표는 위를 향함)
+  useEffect(() => {
+    const map = mapRef.current as RotatableMap | null;
+    if (!ready || !map?.setBearing) return;
+    map.setBearing(headingUp && heading !== null ? (360 - heading) % 360 : 0);
+  }, [ready, headingUp, heading]);
 
   // 따라가기
   useEffect(() => {
@@ -237,7 +266,7 @@ export default function MapView(props: Props) {
   return (
     <div
       ref={containerRef}
-      className={`absolute inset-0 ${props.pickMode ? "cursor-crosshair" : ""}`}
+      className={`absolute inset-0 ${props.pickMode ? "cursor-crosshair" : ""} ${dark ? "ebike-map-dark" : ""}`}
       style={{ background: "#e5e7eb" }}
     />
   );

@@ -22,6 +22,10 @@ export type EbikeSettings = {
   profile: RouteProfile;
   cycleLayer: boolean;
   keepAwake: boolean;
+  /** 지도 테마: 자동(일몰 후 어둡게) / 밝게 / 어둡게 */
+  mapTheme: "auto" | "light" | "dark";
+  /** 진행 방향이 위로 오게 지도 회전 */
+  headingUp: boolean;
 };
 
 export const DEFAULT_SETTINGS: EbikeSettings = {
@@ -39,6 +43,8 @@ export const DEFAULT_SETTINGS: EbikeSettings = {
   profile: "safety",
   cycleLayer: true,
   keepAwake: true,
+  mapTheme: "auto",
+  headingUp: false,
 };
 
 const KEY = "ebike-settings-v1";
