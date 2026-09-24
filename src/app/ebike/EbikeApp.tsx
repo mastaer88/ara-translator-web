@@ -2063,14 +2063,6 @@ export default function EbikeApp() {
                     applyBike({ bikeModel: "tx8pro3", tx8BatteryAh: settings.tx8BatteryAh, speedUnlocked: v })
                   }
                 />
-                {settings.speedUnlocked && (
-                  <p className="rounded-lg bg-red-950/60 p-2 text-xs leading-relaxed text-red-200">
-                    ⚠️ 25km/h를 넘도록 개조한 전기자전거는 법적으로 자전거가 아니라 <b>원동기장치자전거</b>로
-                    분류됩니다. 자전거도로 통행이 금지되고 면허·번호판·보험이 필요하며, 사고 시 보험 처리가
-                    거절될 수 있습니다. 사유지·트랙 등 허용된 곳에서만 사용하세요. 이 설정은 배터리·도착 시간
-                    계산에만 쓰입니다.
-                  </p>
-                )}
                 <p className="text-xs text-slate-400">
                   500W 모터 · 20×2.4 팻타이어 · 25.8kg · PAS 3단 + 스로틀 기준으로 계산합니다.
                 </p>
