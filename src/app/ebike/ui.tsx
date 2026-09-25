@@ -50,7 +50,7 @@ export function Sheet({ title, onClose, children }: { title: string; onClose: ()
   return (
     <div className="fixed inset-0 z-[2000] flex flex-col justify-end bg-black/40" onClick={onClose}>
       <div
-        className="max-h-[85vh] overflow-y-auto rounded-t-3xl bg-[#111a2e] px-4 pt-3"
+        className="mx-auto max-h-[85vh] w-full max-w-2xl overflow-y-auto rounded-t-3xl bg-[#111a2e] px-4 pt-3"
         style={{ paddingBottom: "calc(env(safe-area-inset-bottom) + 16px)" }}
         onClick={(e) => e.stopPropagation()}
       >

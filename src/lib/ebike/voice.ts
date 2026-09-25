@@ -3,10 +3,16 @@
  * iOS Safari는 사용자 터치 이벤트 안에서 한 번 speak()를 호출해야 이후 음성이 재생되므로
  * 시작 버튼 등에서 unlock()을 호출해야 한다.
  */
-export type VoiceOptions = { rate: number; volume: number; voiceURI: string | null };
+export type VoiceOptions = {
+  rate: number;
+  volume: number;
+  voiceURI: string | null;
+};
 
 function synth(): SpeechSynthesis | null {
-  return typeof window !== "undefined" && "speechSynthesis" in window ? window.speechSynthesis : null;
+  return typeof window !== "undefined" && "speechSynthesis" in window
+    ? window.speechSynthesis
+    : null;
 }
 
 export function isSpeechSupported(): boolean {
@@ -55,4 +61,10 @@ export function speak(text: string, opts: VoiceOptions, interrupt = false) {
   } else {
     s.speak(u);
   }
+}
+
+/** 말하는 중인 안내를 멈춤 (음성 명령을 듣기 전에) */
+export function stopSpeech() {
+  const s = synth();
+  if (s && (s.speaking || s.pending)) s.cancel();
 }

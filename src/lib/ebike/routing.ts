@@ -31,6 +31,7 @@ export type TurnType =
   | "keep-right"
   | "uturn"
   | "roundabout"
+  | "via"
   | "arrive";
 
 export type Maneuver = {
@@ -63,6 +64,8 @@ export type Route = {
   label?: string;
   /** 배터리 절약 후보를 만든 BRouter 방식 (경로 이탈 시 이 방식으로 빠르게 재탐색) */
   baseProfile?: RouteProfile;
+  /** 경유지 (이름과 출발점부터의 경로상 거리) */
+  via?: { name: string; distAlong: number }[];
 };
 
 export type Place = { name: string; detail: string; location: LatLng; distance?: number | null };
@@ -79,6 +82,7 @@ const TURN_TEXT: Record<TurnType, string> = {
   "keep-right": "오른쪽 길 유지",
   uturn: "유턴",
   roundabout: "회전교차로",
+  via: "경유지",
   arrive: "목적지 도착",
 };
 
@@ -244,10 +248,11 @@ async function routeWithBRouter(
   to: LatLng,
   profile: RouteProfile,
   alternative = 0,
+  via: LatLng[] = [],
 ): Promise<Route> {
   const brouterProfile = profile === "kakao" || profile === "battery" ? "safety" : profile;
   const params = new URLSearchParams({
-    lonlats: `${from.lng},${from.lat}|${to.lng},${to.lat}`,
+    lonlats: [from, ...via, to].map((p) => `${p.lng},${p.lat}`).join("|"),
     profile: brouterProfile,
     alternativeidx: String(alternative),
     format: "geojson",
@@ -324,12 +329,19 @@ function osrmTurn(type: string, modifier?: string): TurnType | null {
   }
 }
 
-async function routeWithOsrm(from: LatLng, to: LatLng, profile: RouteProfile, walk = false): Promise<Route> {
+async function routeWithOsrm(
+  from: LatLng,
+  to: LatLng,
+  profile: RouteProfile,
+  walk = false,
+  via: LatLng[] = [],
+): Promise<Route> {
   const url =
     (walk
       ? `https://routing.openstreetmap.de/routed-foot/route/v1/foot/`
       : `https://routing.openstreetmap.de/routed-bike/route/v1/bike/`) +
-    `${from.lng},${from.lat};${to.lng},${to.lat}?overview=full&geometries=geojson&steps=true`;
+    [from, ...via, to].map((p) => `${p.lng},${p.lat}`).join(";") +
+    `?overview=full&geometries=geojson&steps=true`;
   const data = (await fetchJson(url)) as OsrmResponse;
   const r = data.routes?.[0];
   if (data.code !== "Ok" || !r) throw new Error("경로를 찾지 못했습니다");
@@ -447,23 +459,90 @@ function finalizeRoute(route: Route): Route {
  * - "카카오 자전거": 카카오맵 → 실패하면 BRouter(자전거도로 우선)
  * - 나머지: BRouter → 실패하면 OSRM 자전거
  */
-export async function findBikeRoute(from: LatLng, to: LatLng, profile: RouteProfile): Promise<Route> {
-  if (haversine(from, to) < 20) throw new Error("출발지와 목적지가 너무 가깝습니다");
+export async function findBikeRoute(
+  from: LatLng,
+  to: LatLng,
+  profile: RouteProfile,
+  via: LatLng[] = [],
+): Promise<Route> {
+  if (haversine(from, to) < 20 && via.length === 0) throw new Error("출발지와 목적지가 너무 가깝습니다");
   if (profile === "kakao") {
     try {
-      return await routeWithKakao(from, to, profile, false);
+      return await routeWithKakaoVia(from, to, profile, via);
     } catch (err) {
       console.warn("카카오 자전거 길찾기 실패, BRouter로 대체", err);
-      const r = await routeWithBRouter(from, to, "safety").catch(() => routeWithOsrm(from, to, profile));
+      const r = await routeWithBRouter(from, to, "safety", 0, via).catch(() =>
+        routeWithOsrm(from, to, profile, false, via),
+      );
       return { ...r, profile, note: "카카오 길찾기를 쓸 수 없어 자전거도로 우선 경로로 찾았습니다" };
     }
   }
   try {
-    return await routeWithBRouter(from, to, profile);
+    return await routeWithBRouter(from, to, profile, 0, via);
   } catch (err) {
     console.warn("BRouter 실패, OSRM으로 재시도", err);
-    return await routeWithOsrm(from, to, profile);
+    return await routeWithOsrm(from, to, profile, false, via);
   }
+}
+
+/** 카카오 길찾기는 출발·도착만 받으므로 경유지가 있으면 구간별로 찾아 이어 붙임 */
+async function routeWithKakaoVia(
+  from: LatLng,
+  to: LatLng,
+  profile: RouteProfile,
+  via: LatLng[],
+): Promise<Route> {
+  if (via.length === 0) return routeWithKakao(from, to, profile, false);
+  const stops = [from, ...via, to];
+  const parts: Route[] = [];
+  for (let i = 0; i < stops.length - 1; i++)
+    parts.push(await routeWithKakao(stops[i], stops[i + 1], profile, false));
+  return mergeRoutes(parts);
+}
+
+/** 여러 구간 경로를 하나로 합침 (구간 끝의 "도착" 안내는 빼고 마지막에 하나만) */
+function mergeRoutes(parts: Route[]): Route {
+  const coords: LatLng[] = [];
+  const elev: number[] = [];
+  const maneuvers: Maneuver[] = [];
+  let offset = 0;
+  for (const part of parts) {
+    const skip = coords.length > 0 ? 1 : 0; // 이어지는 첫 점은 앞 구간의 끝점과 같음
+    coords.push(...part.coords.slice(skip));
+    if (part.elev) elev.push(...part.elev.slice(skip));
+    for (const m of part.maneuvers) {
+      if (m.type !== "arrive") maneuvers.push({ ...m, distAlong: m.distAlong + offset });
+    }
+    offset += part.distance;
+  }
+  const cum = cumulativeDistances(coords);
+  return finalizeRoute({
+    ...parts[0],
+    coords,
+    cum,
+    distance: cum[cum.length - 1] ?? 0,
+    maneuvers,
+    elev: elev.length === coords.length ? elev : undefined,
+    landingUrl: null,
+  });
+}
+
+/** 경로에 경유지 안내(📍)를 넣음. 경유지는 순서대로 경로 위에 투영 */
+export function annotateVia(route: Route, via: { name: string; location: LatLng }[]): Route {
+  if (via.length === 0) return route;
+  let fromIdx = 0;
+  const marks: { name: string; distAlong: number }[] = [];
+  const maneuvers = [...route.maneuvers];
+  for (const v of via) {
+    const proj = projectOnRoute(v.location, route.coords.slice(fromIdx), route.cum.slice(fromIdx));
+    const idx = fromIdx + proj.index;
+    const distAlong = proj.distAlong; // 잘라낸 cum도 출발점 기준 거리 그대로
+    fromIdx = idx;
+    marks.push({ name: v.name, distAlong });
+    maneuvers.push({ distAlong, type: "via", text: `경유지 ${v.name}`, location: v.location });
+  }
+  maneuvers.sort((a, b) => a.distAlong - b.distAlong);
+  return { ...route, maneuvers, via: marks };
 }
 
 /** 고도가 없는 경로(카카오·OSRM)는 Open-Meteo 고도로 채움. 실패하면 고도 없이 (평지로 계산) */
@@ -482,8 +561,8 @@ export async function ensureElevation(route: Route): Promise<Route> {
  * 배터리 절약 경로 후보: BRouter 자전거도로 우선·균형·빠른 길 + 자전거도로 우선의 대안 경로.
  * 비슷한 경로는 하나로 합치고, 모두 고도를 채워서 돌려준다.
  */
-export async function findBatteryCandidates(from: LatLng, to: LatLng): Promise<Route[]> {
-  if (haversine(from, to) < 20) throw new Error("출발지와 목적지가 너무 가깝습니다");
+export async function findBatteryCandidates(from: LatLng, to: LatLng, via: LatLng[] = []): Promise<Route[]> {
+  if (haversine(from, to) < 20 && via.length === 0) throw new Error("출발지와 목적지가 너무 가깝습니다");
   const tries: [RouteProfile, number, string][] = [
     ["safety", 0, "자전거도로 우선"],
     ["trekking", 0, "균형"],
@@ -492,11 +571,12 @@ export async function findBatteryCandidates(from: LatLng, to: LatLng): Promise<R
   ];
   const results = await Promise.allSettled(
     tries.map(([p, alt, label]) =>
-      routeWithBRouter(from, to, p, alt).then((r) => ({ ...r, label, baseProfile: p })),
+      routeWithBRouter(from, to, p, alt, via).then((r) => ({ ...r, label, baseProfile: p })),
     ),
   );
   let routes: Route[] = results.flatMap((r) => (r.status === "fulfilled" ? [r.value] : []));
-  if (routes.length === 0) routes = [{ ...(await routeWithOsrm(from, to, "battery")), label: "기본 경로" }];
+  if (routes.length === 0)
+    routes = [{ ...(await routeWithOsrm(from, to, "battery", false, via)), label: "기본 경로" }];
 
   // 거리 1% · 좌표가 거의 같은 경로는 중복으로 보고 제거
   const unique: Route[] = [];
