@@ -47,7 +47,10 @@ export function saveBattery(b: BatteryState) {
 }
 
 /** 지금 배터리 %와 주행 가능 거리 (km) 추정 */
-export function estimateBattery(b: BatteryState, odometer: number): { percent: number; rangeKm: number } | null {
+export function estimateBattery(
+  b: BatteryState,
+  odometer: number,
+): { percent: number; rangeKm: number } | null {
   if (b.percent === null) return null;
   const usedWh = (Math.max(0, odometer - b.odometerAt) / 1000) * b.whPerKm;
   const percent = Math.max(0, b.percent - (usedWh / b.capacityWh) * 100);
@@ -68,4 +71,26 @@ export function recordPercent(b: BatteryState, percent: number, odometer: number
     }
   }
   return { ...b, percent, odometerAt: odometer, setAt: Date.now(), whPerKm, learned };
+}
+
+// ───────────── 배터리 계산용 주행거리계 ─────────────
+// 저장된 주행 기록 합계를 쓰면 기록 삭제·동기화·백업 복원 때 배터리 추정이 흔들리므로 따로 누적한다.
+const ODO_KEY = "ebike-odometer-v1";
+
+/** 이 기기에서 달린 누적 거리 (m). 아직 없으면 null */
+export function loadOdometer(): number | null {
+  try {
+    const v = localStorage.getItem(ODO_KEY);
+    return v === null ? null : Number(v) || 0;
+  } catch {
+    return null;
+  }
+}
+
+export function saveOdometer(meters: number) {
+  try {
+    localStorage.setItem(ODO_KEY, String(Math.round(meters)));
+  } catch {
+    // 무시
+  }
 }

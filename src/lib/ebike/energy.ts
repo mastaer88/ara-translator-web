@@ -83,8 +83,9 @@ const G = 9.81;
 const RHO = 1.2; // 공기 밀도
 const STOP_GO = 1.3; // 신호 대기·출발 가속 손실
 
-/** 코치·경로 비교의 기준 단계 (가운데 단계) */
-export const referenceLevel = (m: BikeModel) => m.levels[Math.floor((m.levels.length - 1) / 2)];
+/** 코치·경로 비교의 기준 단계 위치 (가운데 단계) */
+export const referenceIndex = (levelCount: number) => Math.floor((levelCount - 1) / 2);
+export const referenceLevel = (m: BikeModel) => m.levels[referenceIndex(m.levels.length)];
 
 export type EnergyOptions = {
   massKg: number;

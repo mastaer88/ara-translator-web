@@ -69,3 +69,19 @@ export function saveDeletedRides(ids: string[]) {
 export function makePlace(name: string, p: LatLng): SavedPlace {
   return { id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, name, lat: p.lat, lng: p.lng };
 }
+
+/** 백업에서 되살린 주행 id — 다음 동기화 때 서버의 삭제 기록에서도 빼기 위함 */
+const RESTORED_KEY = "ebike-restored-rides-v1";
+
+export function loadRestoredRides(): string[] {
+  try {
+    const raw = localStorage.getItem(RESTORED_KEY);
+    return raw ? (JSON.parse(raw) as string[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+export function saveRestoredRides(ids: string[]) {
+  write(RESTORED_KEY, Array.from(new Set(ids)));
+}
