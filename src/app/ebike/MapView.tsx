@@ -12,6 +12,8 @@ type Props = {
   accuracy: number | null;
   route: Route | null;
   destination: LatLng | null;
+  /** 경유지 */
+  via: LatLng[];
   /** 기록 보기: 지난 주행 경로 */
   track: LatLng[] | null;
   /** 저장한 주차 위치 */
@@ -49,8 +51,20 @@ function positionIcon(L: typeof Leaflet, heading: number | null) {
 }
 
 export default function MapView(props: Props) {
-  const { position, heading, accuracy, route, destination, track, parking, focus, follow, cycleLayer, dark, headingUp } =
-    props;
+  const {
+    position,
+    heading,
+    accuracy,
+    route,
+    destination,
+    track,
+    parking,
+    focus,
+    follow,
+    cycleLayer,
+    dark,
+    headingUp,
+  } = props;
   const containerRef = useRef<HTMLDivElement>(null);
   const LRef = useRef<typeof Leaflet | null>(null);
   const mapRef = useRef<Leaflet.Map | null>(null);
@@ -59,6 +73,7 @@ export default function MapView(props: Props) {
   const accCircleRef = useRef<Leaflet.Circle | null>(null);
   const routeLayerRef = useRef<Leaflet.LayerGroup | null>(null);
   const destMarkerRef = useRef<Leaflet.CircleMarker | null>(null);
+  const viaLayerRef = useRef<Leaflet.LayerGroup | null>(null);
   const trackLayerRef = useRef<Leaflet.LayerGroup | null>(null);
   const parkingMarkerRef = useRef<Leaflet.Marker | null>(null);
   const callbacksRef = useRef(props);
@@ -201,6 +216,30 @@ export default function MapView(props: Props) {
     }
   }, [ready, route]);
 
+  // 경유지 표시 (번호가 붙은 주황색 점)
+  useEffect(() => {
+    const L = LRef.current;
+    const map = mapRef.current;
+    if (!ready || !L || !map) return;
+    viaLayerRef.current?.remove();
+    viaLayerRef.current = null;
+    if (props.via.length === 0) return;
+    const group = L.layerGroup().addTo(map);
+    props.via.forEach((v, i) =>
+      L.marker([v.lat, v.lng], {
+        icon: L.divIcon({
+          className: "",
+          iconSize: [26, 26],
+          iconAnchor: [13, 13],
+          html: `<div style="width:26px;height:26px;border-radius:9999px;background:#f59e0b;border:3px solid #fff;color:#111;font:700 13px/20px sans-serif;text-align:center;box-shadow:0 1px 4px rgba(0,0,0,.4)">${i + 1}</div>`,
+        }),
+      })
+        .bindTooltip(`경유지 ${i + 1}`)
+        .addTo(group),
+    );
+    viaLayerRef.current = group;
+  }, [ready, props.via]);
+
   // 목적지 표시
   useEffect(() => {
     const L = LRef.current;
@@ -268,8 +307,14 @@ export default function MapView(props: Props) {
 
   return (
     // React가 바꾸는 class는 바깥 div에만 둔다 (Leaflet이 지도 div에 붙인 class를 덮어쓰지 않도록)
-    <div className={`absolute inset-0 ${props.pickMode ? "cursor-crosshair" : ""} ${dark ? "ebike-map-dark" : ""}`}>
-      <div ref={containerRef} className="absolute inset-0" style={{ background: dark ? "#1a1f29" : "#e5e7eb" }} />
+    <div
+      className={`absolute inset-0 ${props.pickMode ? "cursor-crosshair" : ""} ${dark ? "ebike-map-dark" : ""}`}
+    >
+      <div
+        ref={containerRef}
+        className="absolute inset-0"
+        style={{ background: dark ? "#1a1f29" : "#e5e7eb" }}
+      />
     </div>
   );
 }

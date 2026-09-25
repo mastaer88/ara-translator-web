@@ -16,6 +16,7 @@ import {
 import {
   NEARBY_KINDS,
   PROFILE_LABELS,
+  annotateVia,
   ensureElevation,
   findBatteryCandidates,
   findBikeRoute,
@@ -74,7 +75,18 @@ import {
   windName,
   type Weather,
 } from "@/lib/ebike/weather";
-import { getKoreanVoices, isSpeechSupported, speak, unlockSpeech } from "@/lib/ebike/voice";
+import {
+  getKoreanVoices,
+  isSpeechSupported,
+  speak,
+  stopSpeech,
+  unlockSpeech,
+} from "@/lib/ebike/voice";
+import {
+  isVoiceCommandSupported,
+  listenOnce,
+  parseCommand,
+} from "@/lib/ebike/voiceCommand";
 import { loadSettings, saveSettings, type EbikeSettings } from "./settings";
 import BatterySheet from "./BatterySheet";
 import CoachPanel from "./CoachPanel";
@@ -95,14 +107,31 @@ import SosOverlay from "./SosOverlay";
 import ParkingSheet from "./ParkingSheet";
 import SyncSection from "./SyncSection";
 import LocationSheet from "./LocationSheet";
-import { BigButton, MapButton, Row, Section, Sheet, Slider, Stat, Toggle } from "./ui";
+import {
+  BigButton,
+  MapButton,
+  Row,
+  Section,
+  Sheet,
+  Slider,
+  Stat,
+  Toggle,
+} from "./ui";
 
 const MapView = dynamic(() => import("./MapView"), { ssr: false });
 
 type RideStatus = "idle" | "riding" | "paused";
 type GpsStatus = "off" | "waiting" | "on" | "error";
 /** walk: 걸어서 가는 목적지 (주차 위치로 돌아가기 등) */
-type Destination = { name: string; location: LatLng; walk?: boolean };
+type Destination = {
+  name: string;
+  location: LatLng;
+  walk?: boolean;
+  /** 경유지 (들를 순서대로, 최대 3곳) */
+  via?: { name: string; location: LatLng }[];
+};
+
+const MAX_VIA = 3;
 
 /** 걷기 안내의 기본 속도 (km/h) */
 const WALK_KMH = 4.5;
@@ -131,7 +160,9 @@ const ARRIVE_DIST = 25;
 
 /** 설정에 맞는 자전거 모델 */
 function bikeModelOf(s: EbikeSettings): BikeModel {
-  return s.bikeModel === "tx8pro3" ? motoveloTx8Pro3(s.speedUnlocked) : GENERIC_BIKE;
+  return s.bikeModel === "tx8pro3"
+    ? motoveloTx8Pro3(s.speedUnlocked)
+    : GENERIC_BIKE;
 }
 
 /** 보조 단계 코치: 도착 시 최소로 남길 배터리 (%) */
@@ -141,12 +172,18 @@ const nowMs = () => Date.now();
 const COACH_RESERVE = 15;
 
 /** 받침 유무에 맞는 조사 ("에코를", "보통을", "에코로", "보통으로") */
-function withParticle(word: string, withBatchim: string, without: string): string {
+function withParticle(
+  word: string,
+  withBatchim: string,
+  without: string,
+): string {
   const code = word.charCodeAt(word.length - 1) - 0xac00;
   const has = code >= 0 && code <= 11171 && code % 28 !== 0;
   // "으로/로"는 ㄹ 받침 뒤에도 "로"
   const rieul = code >= 0 && code % 28 === 8;
-  return word + (has && !(withBatchim === "으로" && rieul) ? withBatchim : without);
+  return (
+    word + (has && !(withBatchim === "으로" && rieul) ? withBatchim : without)
+  );
 }
 
 const THEME_LABEL: Record<EbikeSettings["mapTheme"], string> = {
@@ -154,11 +191,12 @@ const THEME_LABEL: Record<EbikeSettings["mapTheme"], string> = {
   light: "밝게",
   dark: "어둡게",
 };
-const NEXT_THEME: Record<EbikeSettings["mapTheme"], EbikeSettings["mapTheme"]> = {
-  auto: "light",
-  light: "dark",
-  dark: "auto",
-};
+const NEXT_THEME: Record<EbikeSettings["mapTheme"], EbikeSettings["mapTheme"]> =
+  {
+    auto: "light",
+    light: "dark",
+    dark: "auto",
+  };
 
 const EMPTY_RIDE = { distance: 0, movingTime: 0, maxSpeed: 0, elapsed: 0 };
 
@@ -174,6 +212,7 @@ const TURN_ICON: Record<TurnType, string> = {
   "keep-right": "↗",
   uturn: "↶",
   roundabout: "⟳",
+  via: "📍",
   arrive: "🏁",
 };
 
@@ -205,7 +244,10 @@ export default function EbikeApp() {
   const [viewing, setViewing] = useState<RideRecord | null>(null);
   const overSpeedRef = useRef({ count: 0, lastWarn: 0 });
   /** 도착 시간 계산용 속도: 지금 속도와 최근 몇 초 평균(지수 이동 평균) */
-  const etaSpeedRef = useRef<{ live: number; smooth: number | null }>({ live: 0, smooth: null });
+  const etaSpeedRef = useRef<{ live: number; smooth: number | null }>({
+    live: 0,
+    smooth: null,
+  });
   const [overSpeed, setOverSpeed] = useState(false);
 
   // 내비게이션
@@ -222,6 +264,8 @@ export default function EbikeApp() {
     /** 보조 단계 코치: 마지막으로 확인한 지점(m)과 추천 단계 */
     lastCoachAt: 0,
     lastRec: "" as string,
+    /** 지금 경로에서 이미 들른 경유지 수 */
+    viaDone: 0,
     offCount: 0,
     lastReroute: 0,
     rerouting: false,
@@ -274,14 +318,21 @@ export default function EbikeApp() {
     saveSettings(settings);
   }, [settings]);
 
-  const update = useCallback(<K extends keyof EbikeSettings>(key: K, value: EbikeSettings[K]) => {
-    setSettings((s) => ({ ...s, [key]: value }));
-  }, []);
+  const update = useCallback(
+    <K extends keyof EbikeSettings>(key: K, value: EbikeSettings[K]) => {
+      setSettings((s) => ({ ...s, [key]: value }));
+    },
+    [],
+  );
 
   const say = useCallback((text: string, interrupt = false) => {
     const s = settingsRef.current;
     if (!s.voiceEnabled) return;
-    speak(text, { rate: s.rate, volume: s.volume, voiceURI: s.voiceURI }, interrupt);
+    speak(
+      text,
+      { rate: s.rate, volume: s.volume, voiceURI: s.voiceURI },
+      interrupt,
+    );
   }, []);
 
   // 한국어 음성 목록 (iOS는 비동기로 로드됨)
@@ -316,7 +367,10 @@ export default function EbikeApp() {
 
   useEffect(() => {
     const onVisible = () => {
-      if (document.visibilityState === "visible" && rideStatusRef.current !== "idle") {
+      if (
+        document.visibilityState === "visible" &&
+        rideStatusRef.current !== "idle"
+      ) {
         wakeLockRef.current = null; // 백그라운드 전환 시 자동 해제되므로 다시 요청
         acquireWakeLock();
       }
@@ -328,7 +382,10 @@ export default function EbikeApp() {
   // ───────────── 경로 탐색 ─────────────
   const computeRoute = useCallback(
     async (dest: Destination, from?: LatLng | null, profile?: RouteProfile) => {
-      const origin = from ?? positionRef.current ?? (await getCurrentPosition().catch(() => null));
+      const origin =
+        from ??
+        positionRef.current ??
+        (await getCurrentPosition().catch(() => null));
       if (!origin) {
         toast.error("현재 위치를 알 수 없습니다. 위치 권한을 확인하세요.");
         return null;
@@ -341,7 +398,10 @@ export default function EbikeApp() {
           // 여러 경로의 배터리 사용량(보통 단계)을 계산해 가장 적은 경로 선택
           const s = settingsRef.current;
           const e = energyRef.current;
-          const list = await findBatteryCandidates(origin, dest.location);
+          const viaPts = (dest.via ?? []).map((v) => v.location);
+          const list = (
+            await findBatteryCandidates(origin, dest.location, viaPts)
+          ).map((c) => annotateVia(c, dest.via ?? []));
           const scored = list
             .map((c) => ({
               c,
@@ -353,7 +413,8 @@ export default function EbikeApp() {
                   wind: e.wind,
                   model,
                 });
-                return en.levels[model.levels.indexOf(referenceLevel(model))].wh;
+                return en.levels[model.levels.indexOf(referenceLevel(model))]
+                  .wh;
               })(),
             }))
             .sort((a, b) => a.wh - b.wh);
@@ -362,10 +423,19 @@ export default function EbikeApp() {
         } else {
           r = dest.walk
             ? await findWalkRoute(origin, dest.location)
-            : await findBikeRoute(origin, dest.location, prof);
+            : annotateVia(
+                await findBikeRoute(
+                  origin,
+                  dest.location,
+                  prof,
+                  (dest.via ?? []).map((v) => v.location),
+                ),
+                dest.via ?? [],
+              );
           setCandidates(null);
         }
         if (r.note) toast.info(r.note);
+        navRef.current.viaDone = 0;
         navRef.current.route = r;
         navRef.current.announced = new Map();
         navRef.current.offCount = 0;
@@ -381,7 +451,9 @@ export default function EbikeApp() {
         }
         return r;
       } catch (err) {
-        toast.error(`경로 탐색 실패: ${err instanceof Error ? err.message : String(err)}`);
+        toast.error(
+          `경로 탐색 실패: ${err instanceof Error ? err.message : String(err)}`,
+        );
         return null;
       } finally {
         setRouting(false);
@@ -397,7 +469,8 @@ export default function EbikeApp() {
     navRef.current.navigating = false;
     setNavigating(false);
     setProgress(null);
-    if (wasNavigating && rideStatusRef.current === "idle") idleCleanupRef.current();
+    if (wasNavigating && rideStatusRef.current === "idle")
+      idleCleanupRef.current();
   }, []);
 
   const clearDestination = useCallback(() => {
@@ -420,7 +493,9 @@ export default function EbikeApp() {
     const r = rideRef.current;
     // 걷기 안내에는 자전거 주행 평균을 쓰지 않음
     const rideAvg =
-      !navRef.current.route?.walk && r.movingTime > 20 ? (r.distance / r.movingTime) * 3.6 : null;
+      !navRef.current.route?.walk && r.movingTime > 20
+        ? (r.distance / r.movingTime) * 3.6
+        : null;
     let kmh: number;
     let basis: EtaBasis;
     if (live > MOVING_KMH && smooth !== null) {
@@ -433,11 +508,18 @@ export default function EbikeApp() {
       kmh = smooth;
       basis = "average";
     } else {
-      kmh = navRef.current.route?.walk ? WALK_KMH : settingsRef.current.cruiseSpeed;
+      kmh = navRef.current.route?.walk
+        ? WALK_KMH
+        : settingsRef.current.cruiseSpeed;
       basis = "setting";
     }
     const etaSec = remaining / (kmh / 3.6);
-    return { etaSec, etaKmh: kmh, etaBasis: basis, arriveAt: Date.now() + etaSec * 1000 };
+    return {
+      etaSec,
+      etaKmh: kmh,
+      etaBasis: basis,
+      arriveAt: Date.now() + etaSec * 1000,
+    };
   }, []);
 
   const updateNavigation = useCallback(
@@ -452,10 +534,15 @@ export default function EbikeApp() {
       if (proj.distFromRoute > Math.max(OFF_ROUTE_DIST, acc) && acc <= 60) {
         nav.offCount++;
         const now = Date.now();
-        if (nav.offCount >= 3 && !nav.rerouting && now - nav.lastReroute > 15000) {
+        if (
+          nav.offCount >= 3 &&
+          !nav.rerouting &&
+          now - nav.lastReroute > 15000
+        ) {
           nav.rerouting = true;
           nav.lastReroute = now;
-          if (settingsRef.current.navVoice) say("경로를 벗어났습니다. 경로를 다시 탐색합니다.", true);
+          if (settingsRef.current.navVoice)
+            say("경로를 벗어났습니다. 경로를 다시 탐색합니다.", true);
           computeRoute(
             nav.destination,
             p,
@@ -464,7 +551,9 @@ export default function EbikeApp() {
           )
             .then((newRoute) => {
               if (newRoute && nav.navigating && settingsRef.current.navVoice) {
-                say(`새 경로로 안내합니다. 목적지까지 ${spokenDistance(newRoute.distance)}입니다.`);
+                say(
+                  `새 경로로 안내합니다. 목적지까지 ${spokenDistance(newRoute.distance)}입니다.`,
+                );
               }
             })
             .finally(() => {
@@ -475,29 +564,67 @@ export default function EbikeApp() {
         nav.offCount = 0;
       }
 
+      // 경유지 도착: 들른 경유지는 목적지에서 빼서, 경로 이탈 재탐색 때 남은 경유지만 거치게 함
+      const vias = r.via ?? [];
+      if (
+        nav.viaDone < vias.length &&
+        proj.distFromRoute < 60 &&
+        proj.distAlong >= vias[nav.viaDone].distAlong - 25
+      ) {
+        const v = vias[nav.viaDone];
+        nav.viaDone++;
+        const d = nav.destination;
+        if (d.via?.length) {
+          const nd = { ...d, via: d.via.slice(1) };
+          nav.destination = nd;
+          setDestination(nd);
+        }
+        if (settingsRef.current.navVoice) {
+          const nextVia = vias[nav.viaDone];
+          say(
+            `경유지 ${v.name}에 도착했습니다. ` +
+              (nextVia
+                ? `다음 경유지 ${withParticle(nextVia.name, "으로", "로")} 안내합니다.`
+                : `${withParticle(nav.destination.name, "으로", "로")} 안내합니다.`),
+            true,
+          );
+        }
+      }
+
       const remaining = Math.max(0, r.distance - proj.distAlong);
       const straightToDest = haversine(p, nav.destination.location);
       if (remaining <= ARRIVE_DIST || straightToDest <= ARRIVE_DIST) {
-        if (settingsRef.current.navVoice) say("목적지에 도착했습니다. 길 안내를 종료합니다.", true);
+        if (settingsRef.current.navVoice)
+          say("목적지에 도착했습니다. 길 안내를 종료합니다.", true);
         toast.success("목적지에 도착했습니다 🎉");
         stopNavigation();
         return;
       }
 
-      const idx = r.maneuvers.findIndex((m) => m.distAlong > proj.distAlong + 3);
+      // 이미 들른 경유지 안내는 건너뜀
+      let viaSeen = 0;
+      const idx = r.maneuvers.findIndex((m) => {
+        if (m.type === "via" && viaSeen++ < nav.viaDone) return false;
+        return m.distAlong > proj.distAlong + 3;
+      });
       const next = idx >= 0 ? r.maneuvers[idx] : null;
       const distToNext = next ? next.distAlong - proj.distAlong : remaining;
       setProgress({ remaining, next, distToNext, ...estimateEta(remaining) });
 
       // 보조 단계 코치: 1km마다 남은 구간의 배터리를 다시 계산해 추천 단계가 바뀌면 알림
       const ec = energyRef.current;
-      if (ec.energy && ec.percent !== null && proj.distAlong - nav.lastCoachAt >= 1000) {
+      if (
+        ec.energy &&
+        ec.percent !== null &&
+        proj.distAlong - nav.lastCoachAt >= 1000
+      ) {
         nav.lastCoachAt = proj.distAlong;
         const at = Math.min(proj.index, ec.energy.levels[0].cumWh.length - 1);
         let rec: AssistLevel | null = null;
         let recArrive = 0;
         for (const l of ec.energy.levels) {
-          const arrive = ec.percent - ((l.wh - l.cumWh[at]) / ec.capacity) * 100;
+          const arrive =
+            ec.percent - ((l.wh - l.cumWh[at]) / ec.capacity) * 100;
           if (arrive >= COACH_RESERVE) {
             rec = l.level;
             recArrive = arrive;
@@ -506,7 +633,8 @@ export default function EbikeApp() {
         const id = rec?.id ?? "none";
         const levels = ec.energy.levels;
         if (id !== nav.lastRec) {
-          const idxOf = (x: string) => levels.findIndex((l) => l.level.id === x);
+          const idxOf = (x: string) =>
+            levels.findIndex((l) => l.level.id === x);
           const lower = idxOf(id) < idxOf(nav.lastRec);
           nav.lastRec = id;
           setCoachLive(
@@ -558,7 +686,13 @@ export default function EbikeApp() {
   // ───────────── GPS 위치 처리 ─────────────
   const handleFix = useCallback(
     (pos: GeolocationPosition) => {
-      const { latitude, longitude, accuracy: acc, speed: rawSpeed, heading: rawHeading } = pos.coords;
+      const {
+        latitude,
+        longitude,
+        accuracy: acc,
+        speed: rawSpeed,
+        heading: rawHeading,
+      } = pos.coords;
       const p = { lat: latitude, lng: longitude };
       const t = pos.timestamp;
       const last = lastFixRef.current;
@@ -579,12 +713,18 @@ export default function EbikeApp() {
       // 도착 시간용 속도: 달리는 동안의 속도를 약 5초 단위로 부드럽게 평균
       const eta = etaSpeedRef.current;
       eta.live = kmh;
-      if (kmh > MOVING_KMH) eta.smooth = eta.smooth === null ? kmh : eta.smooth * 0.8 + kmh * 0.2;
+      if (kmh > MOVING_KMH)
+        eta.smooth = eta.smooth === null ? kmh : eta.smooth * 0.8 + kmh * 0.2;
 
       setSpeed((prev) => (kmh === 0 ? 0 : prev * 0.3 + kmh * 0.7));
       setPosition(p);
       setAccuracy(acc);
-      if (rawHeading !== null && !Number.isNaN(rawHeading) && rawHeading >= 0 && kmh > 3)
+      if (
+        rawHeading !== null &&
+        !Number.isNaN(rawHeading) &&
+        rawHeading >= 0 &&
+        kmh > 3
+      )
         setHeading(rawHeading);
       // 방향 정보가 없으면 직전 위치에서 이동한 방향으로 계산
       else if (last && step >= 5 && kmh > 3) setHeading(bearing(last.p, p));
@@ -611,7 +751,8 @@ export default function EbikeApp() {
             Math.round((t - startedAtRef.current) / 1000),
             Math.round(kmh * 10) / 10,
           ];
-          if (pos.coords.altitude !== null) point.push(Math.round(pos.coords.altitude * 10) / 10);
+          if (pos.coords.altitude !== null)
+            point.push(Math.round(pos.coords.altitude * 10) / 10);
           track.push(point);
         }
 
@@ -619,8 +760,11 @@ export default function EbikeApp() {
         if (s.periodicMode === "distance") {
           const every = s.periodicKm * 1000;
           if (r.distance - periodicRef.current.lastDistance >= every) {
-            periodicRef.current.lastDistance = Math.floor(r.distance / every) * every;
-            say(`주행 거리 ${spokenDistance(r.distance)}, 현재 시속 ${Math.round(kmh)}킬로미터`);
+            periodicRef.current.lastDistance =
+              Math.floor(r.distance / every) * every;
+            say(
+              `주행 거리 ${spokenDistance(r.distance)}, 현재 시속 ${Math.round(kmh)}킬로미터`,
+            );
           }
         }
       }
@@ -630,7 +774,10 @@ export default function EbikeApp() {
         overSpeedRef.current.count++;
         setOverSpeed(true);
         const now = Date.now();
-        if (overSpeedRef.current.count >= 2 && now - overSpeedRef.current.lastWarn > 15000) {
+        if (
+          overSpeedRef.current.count >= 2 &&
+          now - overSpeedRef.current.lastWarn > 15000
+        ) {
           overSpeedRef.current.lastWarn = now;
           say(`속도를 줄이세요. 현재 시속 ${Math.round(kmh)}킬로미터입니다.`);
         }
@@ -676,7 +823,8 @@ export default function EbikeApp() {
   }, []);
 
   const stopGps = useCallback(() => {
-    if (watchIdRef.current !== null) navigator.geolocation.clearWatch(watchIdRef.current);
+    if (watchIdRef.current !== null)
+      navigator.geolocation.clearWatch(watchIdRef.current);
     watchIdRef.current = null;
     lastFixRef.current = null;
     setGpsStatus("off");
@@ -785,7 +933,9 @@ export default function EbikeApp() {
           setOdoBase(next);
         }
         if (draft && draft.distance >= 50) {
-          toast.info(`이전 주행(${formatDistance(draft.distance)})을 기록에 저장했습니다.`);
+          toast.info(
+            `이전 주행(${formatDistance(draft.distance)})을 기록에 저장했습니다.`,
+          );
           return persistRide(draft);
         }
       })
@@ -825,7 +975,10 @@ export default function EbikeApp() {
       setRide({ ...r });
       if (r.elapsed % 30 === 0) saveDraft(buildRecord()).catch(() => {});
       const s = settingsRef.current;
-      if (s.periodicMode === "time" && r.elapsed - periodicRef.current.lastTime >= s.periodicMinutes * 60) {
+      if (
+        s.periodicMode === "time" &&
+        r.elapsed - periodicRef.current.lastTime >= s.periodicMinutes * 60
+      ) {
         periodicRef.current.lastTime = r.elapsed;
         const avg = r.movingTime > 0 ? (r.distance / r.movingTime) * 3.6 : 0;
         say(
@@ -924,7 +1077,9 @@ export default function EbikeApp() {
 
   /** 배터리 계산용 누적 거리에 이번 주행 거리를 더함 */
   const addOdometer = (meters: number) => {
-    const next = (loadOdometer() ?? rides.reduce((sum, x) => sum + x.distance, 0)) + meters;
+    const next =
+      (loadOdometer() ?? rides.reduce((sum, x) => sum + x.distance, 0)) +
+      meters;
     saveOdometer(next);
     setOdoBase(next);
   };
@@ -933,12 +1088,18 @@ export default function EbikeApp() {
     const r = rideRef.current;
     addOdometer(r.distance);
     const avg = r.movingTime > 0 ? (r.distance / r.movingTime) * 3.6 : 0;
-    say(`주행을 종료합니다. 총 ${spokenDistance(r.distance)}, 평균 시속 ${Math.round(avg)}킬로미터`, true);
+    say(
+      `주행을 종료합니다. 총 ${spokenDistance(r.distance)}, 평균 시속 ${Math.round(avg)}킬로미터`,
+      true,
+    );
     toast.success(
       `주행 종료 · ${formatDistance(r.distance)} · ${formatDuration(r.elapsed)} · 평균 ${avg.toFixed(1)}km/h`,
       {
         duration: 15000,
-        action: { label: "🅿️ 주차 위치 저장", onClick: () => saveParkingHere("") },
+        action: {
+          label: "🅿️ 주차 위치 저장",
+          onClick: () => saveParkingHere(""),
+        },
       },
     );
     setRideStatusBoth("idle");
@@ -969,7 +1130,8 @@ export default function EbikeApp() {
   // ───────────── 주변 찾기 (카카오) ─────────────
   const [nearbyKind, setNearbyKind] = useState<string | null>(null);
   const findNearby = async (kind: NearbyKind) => {
-    const near = positionRef.current ?? (await getCurrentPosition().catch(() => null));
+    const near =
+      positionRef.current ?? (await getCurrentPosition().catch(() => null));
     if (!near) {
       toast.error("현재 위치를 알 수 없습니다.");
       return;
@@ -991,13 +1153,32 @@ export default function EbikeApp() {
     }
   };
 
+  /** 경유지 추가·삭제 (경로 다시 찾기) */
+  const setVia = (via: Destination["via"]) => {
+    if (!destination) return;
+    const nd: Destination = { ...destination, via };
+    setDestination(nd);
+    navRef.current.destination = nd;
+    setResults([]);
+    computeRoute(nd);
+  };
+  const addVia = (place: Place) => {
+    const cur = destination?.via ?? [];
+    if (cur.length >= MAX_VIA) {
+      toast.info(`경유지는 ${MAX_VIA}곳까지 추가할 수 있습니다.`);
+      return;
+    }
+    setVia([...cur, { name: place.name, location: place.location }]);
+    toast.success(`경유지 추가: ${place.name}`);
+  };
+
   const chooseDestination = async (dest: Destination) => {
     stopNavigation();
     setDestination(dest);
     navRef.current.destination = dest;
     setResults([]);
     setFollow(false);
-    await computeRoute(dest);
+    return computeRoute(dest);
   };
 
   const onPick = async (p: LatLng) => {
@@ -1020,38 +1201,57 @@ export default function EbikeApp() {
     if (kind === "fav") {
       const name = prompt("즐겨찾기 이름", destination.name)?.trim();
       if (!name) return;
-      updatePlaces({ ...places, favorites: [...places.favorites, makePlace(name, destination.location)] });
+      updatePlaces({
+        ...places,
+        favorites: [...places.favorites, makePlace(name, destination.location)],
+      });
       toast.success(`'${name}'을(를) 즐겨찾기에 추가했습니다`);
     } else {
       const label = kind === "home" ? "집" : "회사";
-      updatePlaces({ ...places, [kind]: makePlace(destination.name, destination.location) });
+      updatePlaces({
+        ...places,
+        [kind]: makePlace(destination.name, destination.location),
+      });
       toast.success(`${label}(으)로 저장했습니다`);
     }
   };
 
   const goToPlace = (pl: SavedPlace | null, label: string) => {
     if (!pl) {
-      toast.info(`${label}이(가) 아직 없습니다. 목적지를 검색한 뒤 '${label}(으)로 저장'을 눌러 주세요.`);
+      toast.info(
+        `${label}이(가) 아직 없습니다. 목적지를 검색한 뒤 '${label}(으)로 저장'을 눌러 주세요.`,
+      );
       return;
     }
     setSheet("nav");
-    chooseDestination({ name: pl.name, location: { lat: pl.lat, lng: pl.lng } });
+    chooseDestination({
+      name: pl.name,
+      location: { lat: pl.lat, lng: pl.lng },
+    });
   };
 
   const removeFavorite = (pl: SavedPlace) => {
     if (!confirm(`'${pl.name}'을(를) 즐겨찾기에서 지울까요?`)) return;
-    updatePlaces({ ...places, favorites: places.favorites.filter((f) => f.id !== pl.id) });
+    updatePlaces({
+      ...places,
+      favorites: places.favorites.filter((f) => f.id !== pl.id),
+    });
   };
 
   // ───────────── 내 자전거 모델 ─────────────
   /** 모델·배터리·속도 해제 선택: 배터리 용량·무게·기본 속도·제한 속도·소모량을 함께 맞춤 */
-  const applyBike = (next: Pick<EbikeSettings, "bikeModel" | "tx8BatteryAh" | "speedUnlocked">) => {
+  const applyBike = (
+    next: Pick<EbikeSettings, "bikeModel" | "tx8BatteryAh" | "speedUnlocked">,
+  ) => {
     const merged = { ...settings, ...next };
     if (next.bikeModel === "tx8pro3") {
       const model = motoveloTx8Pro3(next.speedUnlocked);
       // 배터리 용량만 바꿀 때는 사용자가 바꾼 무게·속도 설정을 건드리지 않음
       if (settings.bikeModel !== "tx8pro3") merged.bikeKg = 26;
-      if (settings.bikeModel !== "tx8pro3" || settings.speedUnlocked !== next.speedUnlocked) {
+      if (
+        settings.bikeModel !== "tx8pro3" ||
+        settings.speedUnlocked !== next.speedUnlocked
+      ) {
         merged.cruiseSpeed = next.speedUnlocked ? 28 : 20;
         merged.speedLimit = next.speedUnlocked ? 40 : 25;
         toast.info(
@@ -1066,7 +1266,9 @@ export default function EbikeApp() {
         whPerKm:
           battery.learned > 0
             ? battery.whPerKm
-            : Math.round(flatWhPerKm(model, ref, merged.riderKg + merged.bikeKg) * 10) / 10,
+            : Math.round(
+                flatWhPerKm(model, ref, merged.riderKg + merged.bikeKg) * 10,
+              ) / 10,
       });
     }
     setSettings(merged);
@@ -1082,7 +1284,13 @@ export default function EbikeApp() {
 
   function saveParkingHere(memo: string) {
     const store = (p: LatLng, acc: number | null) => {
-      setParking({ lat: p.lat, lng: p.lng, accuracy: acc, memo, savedAt: Date.now() });
+      setParking({
+        lat: p.lat,
+        lng: p.lng,
+        accuracy: acc,
+        memo,
+        savedAt: Date.now(),
+      });
       setSavingParking(false);
       toast.success("주차 위치를 저장했습니다 🅿️");
     };
@@ -1093,7 +1301,11 @@ export default function EbikeApp() {
     }
     setSavingParking(true);
     navigator.geolocation.getCurrentPosition(
-      (pos) => store({ lat: pos.coords.latitude, lng: pos.coords.longitude }, pos.coords.accuracy),
+      (pos) =>
+        store(
+          { lat: pos.coords.latitude, lng: pos.coords.longitude },
+          pos.coords.accuracy,
+        ),
       () => {
         setSavingParking(false);
         toast.error("현재 위치를 찾지 못해 주차 위치를 저장하지 못했습니다.");
@@ -1107,7 +1319,11 @@ export default function EbikeApp() {
     if (!pk) return;
     setSheet("nav");
     // 자전거를 찾으러 가는 길이므로 걷기 경로
-    chooseDestination({ name: "주차 위치", location: { lat: pk.lat, lng: pk.lng }, walk: true });
+    chooseDestination({
+      name: "주차 위치",
+      location: { lat: pk.lat, lng: pk.lng },
+      walk: true,
+    });
   };
 
   const showParking = () => {
@@ -1136,7 +1352,8 @@ export default function EbikeApp() {
 
   // 배터리: 누적 거리(저장된 주행 + 지금 주행) 기준 추정
   const ridesSum = rides.reduce((sum, r) => sum + r.distance, 0);
-  const odometer = (odoBase ?? ridesSum) + (rideStatus !== "idle" ? ride.distance : 0);
+  const odometer =
+    (odoBase ?? ridesSum) + (rideStatus !== "idle" ? ride.distance : 0);
   const batteryEst = estimateBattery(battery, odometer);
   // 보조 단계별 배터리 사용량 (오르막·바람·무게 반영)
   const massKg = settings.riderKg + settings.bikeKg;
@@ -1146,7 +1363,8 @@ export default function EbikeApp() {
     [settings.bikeModel, settings.speedUnlocked],
   );
   const windOpt = useMemo(
-    () => (weather ? { ms: weather.windMs, fromDeg: weather.windFromDeg } : null),
+    () =>
+      weather ? { ms: weather.windMs, fromDeg: weather.windFromDeg } : null,
     [weather],
   );
   const routeEnergyNow = useMemo(
@@ -1176,7 +1394,12 @@ export default function EbikeApp() {
   );
   const advice =
     batteryEst && routeEnergyNow
-      ? coach(routeEnergyNow, batteryEst.percent, battery.capacityWh, COACH_RESERVE)
+      ? coach(
+          routeEnergyNow,
+          batteryEst.percent,
+          battery.capacityWh,
+          COACH_RESERVE,
+        )
       : null;
   useEffect(() => {
     energyRef.current = {
@@ -1190,21 +1413,36 @@ export default function EbikeApp() {
   const routeBatteryLeft = advice
     ? advice.arrivePercent[referenceLevel(bikeModel).id]
     : batteryEst && route
-      ? batteryEst.percent - ((route.distance / 1000) * battery.whPerKm * 100) / battery.capacityWh
+      ? batteryEst.percent -
+        ((route.distance / 1000) * battery.whPerKm * 100) / battery.capacityWh
       : null;
   const routeWind =
     weather && route && route.coords.length > 1
-      ? headwind(weather, bearing(route.coords[0], route.coords[route.coords.length - 1]))
+      ? headwind(
+          weather,
+          bearing(route.coords[0], route.coords[route.coords.length - 1]),
+        )
       : null;
 
   // 배터리 20% · 10% 아래로 내려가면 음성 경고 (주행 중 한 번씩)
-  const lowLevel = batteryEst ? (batteryEst.percent <= 10 ? 10 : batteryEst.percent <= 20 ? 20 : null) : null;
+  const lowLevel = batteryEst
+    ? batteryEst.percent <= 10
+      ? 10
+      : batteryEst.percent <= 20
+        ? 20
+        : null
+    : null;
   useEffect(() => {
     if (lowLevel === null) {
       lowBatteryRef.current = null;
       return;
     }
-    if (rideStatus !== "riding" || lowBatteryRef.current === lowLevel || !batteryEst) return;
+    if (
+      rideStatus !== "riding" ||
+      lowBatteryRef.current === lowLevel ||
+      !batteryEst
+    )
+      return;
     lowBatteryRef.current = lowLevel;
     say(
       `배터리가 약 ${lowLevel}퍼센트 남았습니다. 약 ${Math.round(batteryEst.rangeKm)}킬로미터 더 갈 수 있습니다.`,
@@ -1215,15 +1453,27 @@ export default function EbikeApp() {
   const recent = rides.slice(0, 10);
   const recentMoving = recent.reduce((t, r) => t + r.movingTime, 0);
   const recentAvg =
-    recentMoving > 60 ? (recent.reduce((t, r) => t + r.distance, 0) / recentMoving) * 3.6 : null;
+    recentMoving > 60
+      ? (recent.reduce((t, r) => t + r.distance, 0) / recentMoving) * 3.6
+      : null;
   const plan: { kmh: number; label: string } =
     speed > MOVING_KMH
       ? { kmh: speed, label: `현재 속도 ${Math.round(speed)}km/h 기준` }
       : recentAvg !== null && recentAvg > MOVING_KMH
-        ? { kmh: recentAvg, label: `최근 주행 평균 ${recentAvg.toFixed(1)}km/h 기준` }
-        : { kmh: settings.cruiseSpeed, label: `기본 속도 ${settings.cruiseSpeed}km/h 기준` };
-  const walkPlan = route?.walk ? { kmh: WALK_KMH, label: `걷는 속도 ${WALK_KMH}km/h 기준` } : null;
-  const planEtaSec = route ? route.distance / ((walkPlan ?? plan).kmh / 3.6) : 0;
+        ? {
+            kmh: recentAvg,
+            label: `최근 주행 평균 ${recentAvg.toFixed(1)}km/h 기준`,
+          }
+        : {
+            kmh: settings.cruiseSpeed,
+            label: `기본 속도 ${settings.cruiseSpeed}km/h 기준`,
+          };
+  const walkPlan = route?.walk
+    ? { kmh: WALK_KMH, label: `걷는 속도 ${WALK_KMH}km/h 기준` }
+    : null;
+  const planEtaSec = route
+    ? route.distance / ((walkPlan ?? plan).kmh / 3.6)
+    : 0;
 
   // 보조 단계 코치 문구 (안내 시작 시 음성·배너)
   const coachRecId = advice ? (advice.recommended?.id ?? "none") : "";
@@ -1250,16 +1500,21 @@ export default function EbikeApp() {
     navRef.current.navigating = true;
     navRef.current.announced = new Map();
     navRef.current.lastCoachAt = 0;
+    navRef.current.viaDone = 0;
     navRef.current.lastRec = coachRecId;
     setCoachLive(coachBanner);
     setNavigating(true);
     setFollow(true);
     setSheet(null);
     const ratio =
-      route.cyclewayRatio !== null ? `, 자전거도로 비율 ${Math.round(route.cyclewayRatio * 100)}퍼센트` : "";
+      route.cyclewayRatio !== null
+        ? `, 자전거도로 비율 ${Math.round(route.cyclewayRatio * 100)}퍼센트`
+        : "";
     const s = settingsRef.current;
     if (!s.voiceEnabled || !s.navVoice) {
-      toast.warning("음성 안내가 꺼져 있습니다. 설정에서 '음성 안내 사용'과 '길 안내 음성'을 켜 주세요.");
+      toast.warning(
+        "음성 안내가 꺼져 있습니다. 설정에서 '음성 안내 사용'과 '길 안내 음성'을 켜 주세요.",
+      );
     }
     if (s.navVoice) {
       say(
@@ -1273,7 +1528,8 @@ export default function EbikeApp() {
         say("배터리가 부족할 수 있습니다. 충전 상태를 확인하세요.");
       if (weather && weather.rainChance >= 50)
         say(`3시간 안에 비 올 확률 ${weather.rainChance}퍼센트입니다.`);
-      if (routeWind !== null && routeWind >= 4) say("맞바람이 강합니다. 평소보다 느릴 수 있습니다.");
+      if (routeWind !== null && routeWind >= 4)
+        say("맞바람이 강합니다. 평소보다 느릴 수 있습니다.");
     }
     // 시작 안내 음성 뒤에, 다음 GPS 신호를 기다리지 않고 바로 안내 배너·도착 시간 표시 (정지 중에는 아이폰이 위치를 새로 보내지 않음)
     const here = positionRef.current;
@@ -1288,6 +1544,191 @@ export default function EbikeApp() {
       });
     }
   };
+
+  // ───────────── 음성 명령 ─────────────
+  const [listening, setListening] = useState(false);
+  const listenRef = useRef<(() => void) | null>(null);
+  /** 음성으로 목적지를 정하면 경로가 나온 뒤 바로 안내 시작 */
+  const autoStartRef = useRef<Route | null>(null);
+  useEffect(() => {
+    if (
+      autoStartRef.current &&
+      autoStartRef.current === route &&
+      destination &&
+      !routing
+    ) {
+      autoStartRef.current = null;
+      startNavigation();
+    }
+  });
+
+  const reply = (text: string) => {
+    sayUrgent(text);
+    toast.info(`🎙 ${text}`, { duration: 4000 });
+  };
+
+  const voiceGo = async (dest: Destination) => {
+    setSheet(null);
+    const r = await chooseDestination(dest);
+    if (r) autoStartRef.current = r;
+    else reply(`${dest.name}까지 경로를 찾지 못했습니다.`);
+  };
+
+  const runVoiceCommand = async (alts: string[]) => {
+    const heard = alts[0];
+    if (!heard) {
+      reply("잘 못 들었어요. 다시 말씀해 주세요.");
+      return;
+    }
+    // 여러 후보 중 알아들을 수 있는 첫 문장
+    const cmd =
+      alts.map(parseCommand).find((c) => c.type !== "unknown") ??
+      parseCommand(heard);
+    toast(`🎙 "${heard}"`, { duration: 2500 });
+    switch (cmd.type) {
+      case "sos":
+        openSos("sos");
+        return;
+      case "home":
+      case "work": {
+        const pl = cmd.type === "home" ? places.home : places.work;
+        const label = cmd.type === "home" ? "집" : "회사";
+        if (!pl)
+          return reply(
+            `${withParticle(label, "이", "가")} 아직 저장되어 있지 않습니다.`,
+          );
+        reply(`${withParticle(label, "으로", "로")} 안내합니다.`);
+        return voiceGo({
+          name: pl.name,
+          location: { lat: pl.lat, lng: pl.lng },
+        });
+      }
+      case "parkSave":
+        saveParkingHere("");
+        return reply("주차 위치를 저장합니다.");
+      case "parkGo": {
+        const pk = parkingData.parking;
+        if (!pk) return reply("저장된 주차 위치가 없습니다.");
+        reply("주차 위치로 걸어서 안내합니다.");
+        return voiceGo({
+          name: "주차 위치",
+          location: { lat: pk.lat, lng: pk.lng },
+          walk: true,
+        });
+      }
+      case "battery":
+        if (!batteryEst)
+          return reply(
+            "배터리를 아직 설정하지 않았습니다. 배터리 화면에서 충전 상태를 입력해 주세요.",
+          );
+        return reply(
+          `배터리는 약 ${Math.round(batteryEst.percent)}퍼센트, 약 ${Math.round(batteryEst.rangeKm)}킬로미터 더 갈 수 있습니다.` +
+            (routeBatteryLeft !== null && route && !route.walk
+              ? ` 목적지 도착 시 약 ${Math.max(0, Math.round(routeBatteryLeft))}퍼센트 남습니다.`
+              : ""),
+        );
+      case "speed":
+        return reply(
+          rideStatus === "idle"
+            ? "주행 중이 아닙니다."
+            : `현재 시속 ${Math.round(speed)}킬로미터, 평균 시속 ${Math.round(avgSpeed)}킬로미터입니다.`,
+        );
+      case "eta":
+        if (!progress || !navigating) return reply("길 안내 중이 아닙니다.");
+        return reply(
+          `목적지까지 ${spokenDistance(progress.remaining)}, 약 ${formatEta(progress.etaSec)} 뒤 ${formatClock(progress.arriveAt)} 도착 예정입니다.`,
+        );
+      case "weather":
+        if (!weather) return reply("날씨 정보를 아직 받지 못했습니다.");
+        return reply(
+          `${describeWeather(weather.code).text}, ${Math.round(weather.tempC)}도, ${windName(weather.windFromDeg)} 초속 ${Math.round(weather.windMs)}미터. 3시간 안에 비 올 확률 ${weather.rainChance}퍼센트입니다.`,
+        );
+      case "stopNav":
+        if (!navigating) return reply("길 안내 중이 아닙니다.");
+        stopNavigation();
+        return reply("길 안내를 종료합니다.");
+      case "startRide":
+        if (rideStatus === "riding") return reply("이미 주행 중입니다.");
+        return startRide();
+      case "endRide":
+        if (rideStatus === "idle") return reply("주행 중이 아닙니다.");
+        return endRide();
+      case "nearby": {
+        const kind = NEARBY_KINDS.find((k) => k.id === cmd.kind);
+        const near =
+          positionRef.current ?? (await getCurrentPosition().catch(() => null));
+        if (!kind || !near) return reply("현재 위치를 알 수 없습니다.");
+        const list = await searchNearby(kind, near).catch(() => null);
+        const first = list?.[0];
+        if (!first)
+          return reply(
+            `근처에서 ${withParticle(kind.label, "을", "를")} 찾지 못했습니다.`,
+          );
+        reply(
+          `가장 가까운 ${kind.label}, ${withParticle(first.name, "으로", "로")} 안내합니다.`,
+        );
+        return voiceGo({ name: first.name, location: first.location });
+      }
+      case "go": {
+        const fav = places.favorites.find(
+          (f) => f.name.replace(/\s/g, "") === cmd.query.replace(/\s/g, ""),
+        );
+        if (fav) {
+          reply(`${withParticle(fav.name, "으로", "로")} 안내합니다.`);
+          return voiceGo({
+            name: fav.name,
+            location: { lat: fav.lat, lng: fav.lng },
+          });
+        }
+        const list = await searchPlaces(cmd.query, positionRef.current).catch(
+          () => [],
+        );
+        const first = list[0];
+        if (!first)
+          return reply(
+            `${withParticle(cmd.query, "을", "를")} 찾지 못했습니다.`,
+          );
+        reply(`${withParticle(first.name, "으로", "로")} 안내합니다.`);
+        return voiceGo({ name: first.name, location: first.location });
+      }
+      default:
+        return reply(
+          "잘 못 알아들었어요. 예: 집으로, 주차 위치 저장, 배터리 얼마야.",
+        );
+    }
+  };
+
+  const toggleListening = () => {
+    if (listenRef.current) {
+      listenRef.current();
+      return;
+    }
+    unlockSpeech(); // 대답 음성이 나오도록 (iOS: 터치 안에서)
+    stopSpeech(); // 안내 음성이 마이크에 섞이지 않게
+    let job: ReturnType<typeof listenOnce>;
+    try {
+      job = listenOnce();
+    } catch {
+      toast.error("음성 인식을 시작하지 못했습니다.");
+      return;
+    }
+    listenRef.current = job.cancel;
+    setListening(true);
+    job.promise
+      .then(runVoiceCommand)
+      .catch((err: Error) =>
+        toast.error(
+          err.message === "not-allowed" || err.message === "service-not-allowed"
+            ? "마이크·음성 인식 권한을 허용해 주세요. (설정 → Safari → 마이크, 설정 → 개인정보 보호 → 음성 인식)"
+            : "음성 인식에 실패했습니다.",
+        ),
+      )
+      .finally(() => {
+        listenRef.current = null;
+        setListening(false);
+      });
+  };
+  const voiceCommandOk = useMemo(() => isVoiceCommandSupported(), []);
 
   /** 안내 배너를 누르면 현재 안내를 다시 읽어줌 */
   const repeatInstruction = () => {
@@ -1336,7 +1777,9 @@ export default function EbikeApp() {
   useEffect(() => {
     if (!navigating) return;
     const id = setInterval(() => {
-      setProgress((prev) => (prev ? { ...prev, ...estimateEta(prev.remaining) } : prev));
+      setProgress((prev) =>
+        prev ? { ...prev, ...estimateEta(prev.remaining) } : prev,
+      );
     }, 5000);
     return () => clearInterval(id);
   }, [navigating, estimateEta]);
@@ -1379,13 +1822,26 @@ export default function EbikeApp() {
   }, []);
 
   // ───────────── 표시 값 ─────────────
-  const avgSpeed = ride.movingTime > 0 ? (ride.distance / ride.movingTime) * 3.6 : 0;
+  const avgSpeed =
+    ride.movingTime > 0 ? (ride.distance / ride.movingTime) * 3.6 : 0;
   const displaySpeed = Math.round(speed);
-  const mapDark = settings.mapTheme === "dark" || (settings.mapTheme === "auto" && night);
+  const viaPoints = useMemo(
+    () => (destination?.via ?? []).map((v) => v.location),
+    [destination],
+  );
+  const mapDark =
+    settings.mapTheme === "dark" || (settings.mapTheme === "auto" && night);
   const totalDistance =
-    rides.reduce((sum, r) => sum + r.distance, 0) + (rideStatus !== "idle" ? ride.distance : 0);
-  const viewingTrack = useMemo(() => viewing?.points.map(([lat, lng]) => ({ lat, lng })) ?? null, [viewing]);
-  const limitRatio = Math.min(1, speed / Math.max(1, settings.speedLimit * 1.2));
+    rides.reduce((sum, r) => sum + r.distance, 0) +
+    (rideStatus !== "idle" ? ride.distance : 0);
+  const viewingTrack = useMemo(
+    () => viewing?.points.map(([lat, lng]) => ({ lat, lng })) ?? null,
+    [viewing],
+  );
+  const limitRatio = Math.min(
+    1,
+    speed / Math.max(1, settings.speedLimit * 1.2),
+  );
 
   return (
     <div className="fixed inset-0 flex flex-col bg-[#0b1220] text-slate-100 select-none">
@@ -1393,7 +1849,9 @@ export default function EbikeApp() {
         {/* ───── 속도계 ───── */}
         <header
           className={`relative z-[1001] shrink-0 px-4 pb-3 transition-colors landscape:flex landscape:w-[40%] landscape:max-w-md landscape:flex-col landscape:justify-center landscape:overflow-y-auto ${
-            bigSpeed ? "flex flex-1 flex-col justify-center landscape:w-full landscape:max-w-none" : ""
+            bigSpeed
+              ? "flex flex-1 flex-col justify-center landscape:w-full landscape:max-w-none"
+              : ""
           } ${overSpeed ? "bg-red-700" : "bg-[#0b1220]"}`}
           style={{
             paddingTop: "calc(env(safe-area-inset-top) + 10px)",
@@ -1402,10 +1860,16 @@ export default function EbikeApp() {
         >
           <div className="flex items-center justify-between gap-2 text-xs text-slate-300">
             <GpsBadge status={gpsStatus} accuracy={accuracy} />
-            <button onClick={() => setSheet("history")} className="font-mono tabular-nums">
+            <button
+              onClick={() => setSheet("history")}
+              className="font-mono tabular-nums"
+            >
               누적 {(totalDistance / 1000).toFixed(1)}km
             </button>
-            <button onClick={() => setSheet("battery")} className="tabular-nums">
+            <button
+              onClick={() => setSheet("battery")}
+              className="tabular-nums"
+            >
               {batteryEst
                 ? `🔋${Math.round(batteryEst.percent)}% · ${Math.round(batteryEst.rangeKm)}km`
                 : "🔋 입력"}
@@ -1413,24 +1877,35 @@ export default function EbikeApp() {
             {weather ? (
               <button onClick={showWeather} className="tabular-nums">
                 {describeWeather(weather.code).icon}
-                {Math.round(weather.tempC)}° {windName(weather.windFromDeg).replace("풍", "")}
+                {Math.round(weather.tempC)}°{" "}
+                {windName(weather.windFromDeg).replace("풍", "")}
                 {Math.round(weather.windMs)}
               </button>
             ) : (
               <span>
-                {rideStatus === "riding" ? "● 주행 중" : rideStatus === "paused" ? "❚❚ 일시정지" : "대기"}
+                {rideStatus === "riding"
+                  ? "● 주행 중"
+                  : rideStatus === "paused"
+                    ? "❚❚ 일시정지"
+                    : "대기"}
               </span>
             )}
           </div>
           <div className="mt-1 flex items-end justify-center gap-2">
             <span
               className={`font-mono font-bold leading-none tabular-nums ${
-                bigSpeed ? "text-[length:min(42vw,34vh)]" : "text-[88px] landscape:text-[72px]"
+                bigSpeed
+                  ? "text-[length:min(42vw,34vh)]"
+                  : "text-[88px] landscape:text-[72px]"
               }`}
             >
               {displaySpeed}
             </span>
-            <span className={`text-slate-300 ${bigSpeed ? "mb-6 text-3xl" : "mb-3 text-xl"}`}>km/h</span>
+            <span
+              className={`text-slate-300 ${bigSpeed ? "mb-6 text-3xl" : "mb-3 text-xl"}`}
+            >
+              km/h
+            </span>
           </div>
           <div className="mx-auto mt-2 h-2 w-full max-w-md overflow-hidden rounded-full bg-slate-700">
             <div
@@ -1472,6 +1947,7 @@ export default function EbikeApp() {
             accuracy={accuracy}
             route={route}
             destination={destination?.location ?? null}
+            via={viaPoints}
             track={viewingTrack}
             parking={parkingData.parking}
             focus={focus}
@@ -1503,14 +1979,21 @@ export default function EbikeApp() {
             <div className="absolute inset-x-3 top-3 z-[1000] flex items-center justify-between gap-2 rounded-2xl bg-violet-700/95 p-3 text-sm shadow-lg">
               <div className="min-w-0">
                 <div className="font-semibold">
-                  지난 주행 · {new Date(viewing.startedAt).toLocaleDateString("ko-KR")}
+                  지난 주행 ·{" "}
+                  {new Date(viewing.startedAt).toLocaleDateString("ko-KR")}
                 </div>
                 <div className="truncate text-xs text-violet-100">
-                  {formatDistance(viewing.distance)} · {formatDuration(viewing.elapsed)}
-                  {viewing.startName && viewing.endName && ` · ${viewing.startName} → ${viewing.endName}`}
+                  {formatDistance(viewing.distance)} ·{" "}
+                  {formatDuration(viewing.elapsed)}
+                  {viewing.startName &&
+                    viewing.endName &&
+                    ` · ${viewing.startName} → ${viewing.endName}`}
                 </div>
               </div>
-              <button onClick={() => setViewing(null)} className="shrink-0 rounded-lg bg-black/30 px-3 py-1">
+              <button
+                onClick={() => setViewing(null)}
+                className="shrink-0 rounded-lg bg-black/30 px-3 py-1"
+              >
                 닫기
               </button>
             </div>
@@ -1519,7 +2002,10 @@ export default function EbikeApp() {
           {pickMode && (
             <div className="absolute inset-x-3 top-3 z-[1000] flex items-center justify-between rounded-2xl bg-blue-700/95 p-3 text-sm shadow-lg">
               <span>지도를 탭해서 목적지를 선택하세요</span>
-              <button onClick={() => setPickMode(false)} className="rounded-lg bg-black/30 px-3 py-1">
+              <button
+                onClick={() => setPickMode(false)}
+                className="rounded-lg bg-black/30 px-3 py-1"
+              >
                 취소
               </button>
             </div>
@@ -1532,20 +2018,35 @@ export default function EbikeApp() {
               onClick={() => {
                 update("headingUp", !settings.headingUp);
                 toast.info(
-                  settings.headingUp ? "북쪽이 위로 고정됩니다" : "진행 방향이 위로 오도록 지도가 회전합니다",
+                  settings.headingUp
+                    ? "북쪽이 위로 고정됩니다"
+                    : "진행 방향이 위로 오도록 지도가 회전합니다",
                 );
               }}
-              label={settings.headingUp ? "진행 방향 위 (누르면 북쪽 위)" : "북쪽 위 (누르면 진행 방향 위)"}
+              label={
+                settings.headingUp
+                  ? "진행 방향 위 (누르면 북쪽 위)"
+                  : "북쪽 위 (누르면 진행 방향 위)"
+              }
             >
               <svg
                 viewBox="0 0 24 24"
                 className="mx-auto h-8 w-8 transition-transform"
-                style={{ transform: `rotate(${settings.headingUp && heading !== null ? -heading : 0}deg)` }}
+                style={{
+                  transform: `rotate(${settings.headingUp && heading !== null ? -heading : 0}deg)`,
+                }}
                 aria-hidden
               >
                 <path d="M12 2 17 13H7z" fill="#ef4444" />
                 <path d="M12 22 7 13h10z" fill="currentColor" opacity=".5" />
-                <text x="12" y="11" textAnchor="middle" fontSize="6" fontWeight="700" fill="#fff">
+                <text
+                  x="12"
+                  y="11"
+                  textAnchor="middle"
+                  fontSize="6"
+                  fontWeight="700"
+                  fill="#fff"
+                >
                   N
                 </text>
               </svg>
@@ -1565,7 +2066,9 @@ export default function EbikeApp() {
                   icon={mapDark ? "🌙" : "☀️"}
                   label="지도 밝기"
                   value={THEME_LABEL[settings.mapTheme]}
-                  onClick={() => update("mapTheme", NEXT_THEME[settings.mapTheme])}
+                  onClick={() =>
+                    update("mapTheme", NEXT_THEME[settings.mapTheme])
+                  }
                 />
                 <MenuItem
                   icon="🔢"
@@ -1593,13 +2096,34 @@ export default function EbikeApp() {
                 />
               </div>
             )}
-            <MapButton active={menuOpen} onClick={() => setMenuOpen(!menuOpen)} label="지도 메뉴">
+            {voiceCommandOk && (
+              <MapButton
+                active={listening}
+                onClick={toggleListening}
+                label={listening ? "듣는 중 (누르면 취소)" : "음성 명령"}
+              >
+                <span className={listening ? "animate-pulse" : ""}>🎙</span>
+              </MapButton>
+            )}
+            <MapButton
+              active={menuOpen}
+              onClick={() => setMenuOpen(!menuOpen)}
+              label="지도 메뉴"
+            >
               ☰
             </MapButton>
-            <MapButton active={!!parkingData.parking} onClick={() => setSheet("parking")} label="주차 위치">
+            <MapButton
+              active={!!parkingData.parking}
+              onClick={() => setSheet("parking")}
+              label="주차 위치"
+            >
               🅿️
             </MapButton>
-            <MapButton active={follow} onClick={() => locateMe()} label="현재 위치 찾기">
+            <MapButton
+              active={follow}
+              onClick={() => locateMe()}
+              label="현재 위치 찾기"
+            >
               <svg
                 viewBox="0 0 24 24"
                 className={`mx-auto h-7 w-7 ${locating ? "animate-pulse" : ""}`}
@@ -1624,7 +2148,10 @@ export default function EbikeApp() {
               일시정지
             </BigButton>
           ) : (
-            <BigButton className="bg-emerald-500 text-black" onClick={startRide}>
+            <BigButton
+              className="bg-emerald-500 text-black"
+              onClick={startRide}
+            >
               {rideStatus === "paused" ? "계속" : "주행 시작"}
             </BigButton>
           )}
@@ -1633,7 +2160,10 @@ export default function EbikeApp() {
               종료
             </BigButton>
           )}
-          <BigButton className="bg-blue-600" onClick={() => setSheet(sheet === "nav" ? null : "nav")}>
+          <BigButton
+            className="bg-blue-600"
+            onClick={() => setSheet(sheet === "nav" ? null : "nav")}
+          >
             길찾기
           </BigButton>
           <BigButton
@@ -1669,7 +2199,10 @@ export default function EbikeApp() {
               enterKeyHint="search"
               className="min-w-0 flex-1 rounded-xl bg-slate-800 px-3 py-3 text-base outline-none ring-blue-500 focus:ring-2"
             />
-            <button className="rounded-xl bg-blue-600 px-4 font-semibold" disabled={searching}>
+            <button
+              className="rounded-xl bg-blue-600 px-4 font-semibold"
+              disabled={searching}
+            >
               {searching ? "…" : "검색"}
             </button>
           </form>
@@ -1684,14 +2217,18 @@ export default function EbikeApp() {
             📍 지도에서 목적지 선택
           </button>
 
-          <div className="mt-3 text-xs text-slate-400">주변 찾기 (가까운 순)</div>
+          <div className="mt-3 text-xs text-slate-400">
+            주변 찾기 (가까운 순)
+          </div>
           <div className="mt-1 flex gap-2 overflow-x-auto pb-1">
             {NEARBY_KINDS.map((k) => (
               <button
                 key={k.id}
                 onClick={() => findNearby(k)}
                 className={`shrink-0 rounded-full px-3 py-1.5 text-sm ${
-                  nearbyKind === k.id && results.length > 0 ? "bg-blue-700" : "bg-slate-800"
+                  nearbyKind === k.id && results.length > 0
+                    ? "bg-blue-700"
+                    : "bg-slate-800"
                 }`}
               >
                 {k.icon} {k.label}
@@ -1721,8 +2258,14 @@ export default function EbikeApp() {
               </button>
             )}
             {places.favorites.map((f) => (
-              <span key={f.id} className="flex shrink-0 items-center rounded-full bg-slate-800 text-sm">
-                <button onClick={() => goToPlace(f, f.name)} className="py-2 pl-4 pr-1">
+              <span
+                key={f.id}
+                className="flex shrink-0 items-center rounded-full bg-slate-800 text-sm"
+              >
+                <button
+                  onClick={() => goToPlace(f, f.name)}
+                  className="py-2 pl-4 pr-1"
+                >
                   ⭐ {f.name}
                 </button>
                 <button
@@ -1739,26 +2282,40 @@ export default function EbikeApp() {
           {results.length > 0 && (
             <ul className="mt-3 divide-y divide-slate-800 overflow-hidden rounded-xl bg-slate-800/60">
               {results.map((r, i) => (
-                <li key={i}>
+                <li key={i} className="flex items-stretch">
                   <button
-                    className="w-full px-3 py-2 text-left"
-                    onClick={() => chooseDestination({ name: r.name, location: r.location })}
+                    className="min-w-0 flex-1 px-3 py-2 text-left"
+                    onClick={() =>
+                      chooseDestination({ name: r.name, location: r.location })
+                    }
                   >
                     <div className="font-medium">{r.name}</div>
                     <div className="truncate text-xs text-slate-400">
                       {r.detail}
                       {r.distance != null
                         ? ` · ${formatDistance(r.distance)}`
-                        : position && ` · 직선 ${formatDistance(haversine(position, r.location))}`}
+                        : position &&
+                          ` · 직선 ${formatDistance(haversine(position, r.location))}`}
                     </div>
                   </button>
+                  {destination && !destination.walk && (
+                    <button
+                      onClick={() => addVia(r)}
+                      className="shrink-0 border-l border-slate-700 px-3 text-xs text-amber-300"
+                      aria-label={`${r.name} 경유지로 추가`}
+                    >
+                      + 경유
+                    </button>
+                  )}
                 </li>
               ))}
             </ul>
           )}
 
           <div className="mt-4 text-sm text-slate-400">
-            경로 옵션{destination?.walk && " · 🚶 주차 위치까지는 걷기 경로로 안내합니다"}
+            경로 옵션
+            {destination?.walk &&
+              " · 🚶 주차 위치까지는 걷기 경로로 안내합니다"}
           </div>
           <div className="mt-1 grid grid-cols-2 gap-2">
             {(Object.keys(PROFILE_LABELS) as RouteProfile[]).map((p) => (
@@ -1766,38 +2323,86 @@ export default function EbikeApp() {
                 key={p}
                 onClick={() => changeProfile(p)}
                 className={`rounded-xl px-2 py-2 text-sm ${
-                  settings.profile === p ? "bg-emerald-600 font-semibold" : "bg-slate-800 text-slate-300"
+                  settings.profile === p
+                    ? "bg-emerald-600 font-semibold"
+                    : "bg-slate-800 text-slate-300"
                 }`}
               >
                 {PROFILE_LABELS[p].name}
               </button>
             ))}
           </div>
-          <p className="mt-1 text-xs text-slate-500">{PROFILE_LABELS[settings.profile].desc}</p>
+          <p className="mt-1 text-xs text-slate-500">
+            {PROFILE_LABELS[settings.profile].desc}
+          </p>
 
           {destination && (
             <div className="mt-4 rounded-xl bg-slate-800/60 p-3">
               <div className="flex items-start justify-between gap-2">
                 <div className="min-w-0">
                   <div className="text-xs text-slate-400">목적지</div>
-                  <div className="truncate font-semibold">{destination.name}</div>
+                  <div className="truncate font-semibold">
+                    {destination.name}
+                  </div>
+                  {destination.via && destination.via.length > 0 && (
+                    <div className="mt-1 flex flex-wrap gap-1">
+                      {destination.via.map((v, i) => (
+                        <span
+                          key={i}
+                          className="flex items-center rounded-full bg-amber-900/60 pl-2 text-xs text-amber-100"
+                        >
+                          📍 {i + 1}. {v.name}
+                          <button
+                            onClick={() =>
+                              setVia(destination.via!.filter((_, j) => j !== i))
+                            }
+                            className="px-2 py-1 text-amber-300"
+                            aria-label={`경유지 ${v.name} 삭제`}
+                          >
+                            ✕
+                          </button>
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                  {!destination.walk &&
+                    (destination.via?.length ?? 0) < MAX_VIA && (
+                      <div className="mt-1 text-[11px] text-slate-500">
+                        검색·주변 찾기 결과의 “+ 경유”로 들를 곳을 추가할 수
+                        있어요 (최대 {MAX_VIA}곳)
+                      </div>
+                    )}
                 </div>
-                <button onClick={clearDestination} className="text-sm text-slate-400">
+                <button
+                  onClick={clearDestination}
+                  className="text-sm text-slate-400"
+                >
                   지우기
                 </button>
               </div>
               <div className="mt-2 grid grid-cols-3 gap-2 text-xs">
-                <button onClick={() => saveFavorite("home")} className="rounded-lg bg-slate-700 py-1.5">
+                <button
+                  onClick={() => saveFavorite("home")}
+                  className="rounded-lg bg-slate-700 py-1.5"
+                >
                   🏠 집으로 저장
                 </button>
-                <button onClick={() => saveFavorite("work")} className="rounded-lg bg-slate-700 py-1.5">
+                <button
+                  onClick={() => saveFavorite("work")}
+                  className="rounded-lg bg-slate-700 py-1.5"
+                >
                   🏢 회사로 저장
                 </button>
-                <button onClick={() => saveFavorite("fav")} className="rounded-lg bg-slate-700 py-1.5">
+                <button
+                  onClick={() => saveFavorite("fav")}
+                  className="rounded-lg bg-slate-700 py-1.5"
+                >
                   ⭐ 즐겨찾기
                 </button>
               </div>
-              {routing && <div className="mt-2 text-sm text-slate-300">경로 탐색 중…</div>}
+              {routing && (
+                <div className="mt-2 text-sm text-slate-300">경로 탐색 중…</div>
+              )}
               {!routing && route && (
                 <>
                   <div className="mt-2 grid grid-cols-3 gap-2 text-center">
@@ -1808,7 +2413,11 @@ export default function EbikeApp() {
                     />
                     <Stat
                       label="자전거도로"
-                      value={route.cyclewayRatio === null ? "-" : `${Math.round(route.cyclewayRatio * 100)}%`}
+                      value={
+                        route.cyclewayRatio === null
+                          ? "-"
+                          : `${Math.round(route.cyclewayRatio * 100)}%`
+                      }
                     />
                   </div>
                   <div className="mt-1 text-[11px] text-slate-500">
@@ -1818,11 +2427,16 @@ export default function EbikeApp() {
                       : route.source === "brouter"
                         ? "BRouter"
                         : "OSRM"}{" "}
-                    경로 · 예상 시간은 {(walkPlan ?? plan).label}, 안내 중에는 현재 속도로 실시간 계산
+                    경로 · 예상 시간은 {(walkPlan ?? plan).label}, 안내 중에는
+                    현재 속도로 실시간 계산
                   </div>
                   {routeEnergyNow && (
                     <CoachPanel
-                      candidates={settings.profile === "battery" ? candidateEnergies : null}
+                      candidates={
+                        settings.profile === "battery"
+                          ? candidateEnergies
+                          : null
+                      }
                       selected={route}
                       onSelect={(r) => {
                         navRef.current.route = r;
@@ -1848,18 +2462,35 @@ export default function EbikeApp() {
                   )}
                   <ul className="mt-2 space-y-1 text-xs">
                     {routeBatteryLeft !== null && !route.walk && (
-                      <li className={routeBatteryLeft < 10 ? "text-red-300" : "text-slate-300"}>
-                        🔋 도착 시 예상 배터리 {Math.max(0, Math.round(routeBatteryLeft))}%
+                      <li
+                        className={
+                          routeBatteryLeft < 10
+                            ? "text-red-300"
+                            : "text-slate-300"
+                        }
+                      >
+                        🔋 도착 시 예상 배터리{" "}
+                        {Math.max(0, Math.round(routeBatteryLeft))}%
                         {routeBatteryLeft < 10 && " — 부족할 수 있어요"}
                       </li>
                     )}
                     {weather && routeWind !== null && (
-                      <li className={routeWind >= 4 ? "text-amber-300" : "text-slate-300"}>
+                      <li
+                        className={
+                          routeWind >= 4 ? "text-amber-300" : "text-slate-300"
+                        }
+                      >
                         🌬 {windEffectText(routeWind, weather.windMs)}
                       </li>
                     )}
                     {weather && weather.rainChance >= 30 && (
-                      <li className={weather.rainChance >= 50 ? "text-amber-300" : "text-slate-300"}>
+                      <li
+                        className={
+                          weather.rainChance >= 50
+                            ? "text-amber-300"
+                            : "text-slate-300"
+                        }
+                      >
                         ☔ 3시간 안에 비 올 확률 {weather.rainChance}%
                       </li>
                     )}
@@ -1949,6 +2580,7 @@ export default function EbikeApp() {
           onExport={exportRide}
           onNavigate={navigateToRideEnd}
           onDelete={removeRide}
+          whPerKm={battery.whPerKm}
         />
       )}
 
@@ -1985,13 +2617,24 @@ export default function EbikeApp() {
               onChange={(v) => update("voiceEnabled", v)}
             />
             {!isSpeechSupported() && (
-              <p className="text-xs text-red-400">이 브라우저는 음성 합성을 지원하지 않습니다.</p>
+              <p className="text-xs text-red-400">
+                이 브라우저는 음성 합성을 지원하지 않습니다.
+              </p>
             )}
-            <Toggle label="길 안내 음성" value={settings.navVoice} onChange={(v) => update("navVoice", v)} />
+            <Toggle
+              label="길 안내 음성"
+              value={settings.navVoice}
+              onChange={(v) => update("navVoice", v)}
+            />
             <Row label="주기적 속도 안내">
               <select
                 value={settings.periodicMode}
-                onChange={(e) => update("periodicMode", e.target.value as EbikeSettings["periodicMode"])}
+                onChange={(e) =>
+                  update(
+                    "periodicMode",
+                    e.target.value as EbikeSettings["periodicMode"],
+                  )
+                }
                 className="rounded-lg bg-slate-800 px-2 py-1"
               >
                 <option value="off">끄기</option>
@@ -2003,7 +2646,9 @@ export default function EbikeApp() {
               <Row label="안내 간격">
                 <select
                   value={settings.periodicMinutes}
-                  onChange={(e) => update("periodicMinutes", Number(e.target.value))}
+                  onChange={(e) =>
+                    update("periodicMinutes", Number(e.target.value))
+                  }
                   className="rounded-lg bg-slate-800 px-2 py-1"
                 >
                   {[1, 3, 5, 10, 15, 30].map((m) => (
@@ -2111,12 +2756,19 @@ export default function EbikeApp() {
                   label="속도 제한 해제 버전"
                   value={settings.speedUnlocked}
                   onChange={(v) =>
-                    applyBike({ bikeModel: "tx8pro3", tx8BatteryAh: settings.tx8BatteryAh, speedUnlocked: v })
+                    applyBike({
+                      bikeModel: "tx8pro3",
+                      tx8BatteryAh: settings.tx8BatteryAh,
+                      speedUnlocked: v,
+                    })
                   }
                 />
                 <p className="text-xs text-slate-400">
-                  {settings.speedUnlocked ? "속도 경고·기본 속도가 해제 버전 기준으로 바뀝니다. " : ""}500W
-                  모터 · 20×2.4 팻타이어 · 25.8kg · PAS 3단 + 스로틀 기준으로 계산합니다.
+                  {settings.speedUnlocked
+                    ? "속도 경고·기본 속도가 해제 버전 기준으로 바뀝니다. "
+                    : ""}
+                  500W 모터 · 20×2.4 팻타이어 · 25.8kg · PAS 3단 + 스로틀
+                  기준으로 계산합니다.
                 </p>
               </>
             )}
@@ -2138,13 +2790,24 @@ export default function EbikeApp() {
             />
             <div>
               <div className="mb-1 text-xs text-slate-400">
-                완충 시 평지 주행 가능 거리 (배터리 {battery.capacityWh}Wh · 무풍)
+                완충 시 평지 주행 가능 거리 (배터리 {battery.capacityWh}Wh ·
+                무풍)
               </div>
               <div className="grid grid-cols-4 gap-1 text-center">
                 {bikeModel.levels.map((l) => {
-                  const scale = battery.whPerKm / flatWhPerKm(bikeModel, referenceLevel(bikeModel), massKg);
-                  const km = battery.capacityWh / (flatWhPerKm(bikeModel, l, massKg) * scale);
-                  return <Stat key={l.id} label={`${l.name} · ${l.kmh}km/h`} value={`${Math.round(km)}km`} />;
+                  const scale =
+                    battery.whPerKm /
+                    flatWhPerKm(bikeModel, referenceLevel(bikeModel), massKg);
+                  const km =
+                    battery.capacityWh /
+                    (flatWhPerKm(bikeModel, l, massKg) * scale);
+                  return (
+                    <Stat
+                      key={l.id}
+                      label={`${l.name} · ${l.kmh}km/h`}
+                      value={`${Math.round(km)}km`}
+                    />
+                  );
                 })}
               </div>
             </div>
@@ -2197,16 +2860,24 @@ export default function EbikeApp() {
                 className="w-40 rounded-lg bg-slate-900 px-2 py-1.5 text-right"
               />
             </Row>
-            <button onClick={() => openSos("check")} className="w-full rounded-xl bg-slate-800 py-2 text-sm">
+            <button
+              onClick={() => openSos("check")}
+              className="w-full rounded-xl bg-slate-800 py-2 text-sm"
+            >
               넘어짐 알림 미리보기
             </button>
             <p className="text-xs text-slate-500">
-              주행 중 강한 충격 뒤 10초 이상 멈춰 있으면 “괜찮으세요?”를 묻고, 30초 동안 응답이 없으면
-              119·보호자 연락 화면을 엽니다. 웹앱은 문자를 자동으로 보낼 수 없어 버튼을 한 번 눌러야 합니다.
+              주행 중 강한 충격 뒤 10초 이상 멈춰 있으면 “괜찮으세요?”를 묻고,
+              30초 동안 응답이 없으면 119·보호자 연락 화면을 엽니다. 웹앱은
+              문자를 자동으로 보낼 수 없어 버튼을 한 번 눌러야 합니다.
             </p>
           </Section>
 
-          <SyncSection code={syncCode} onCodeChange={setSyncCode} onDataChanged={reloadLocalData} />
+          <SyncSection
+            code={syncCode}
+            onCodeChange={setSyncCode}
+            onDataChanged={reloadLocalData}
+          />
 
           <Section title="화면">
             <Toggle
@@ -2227,7 +2898,12 @@ export default function EbikeApp() {
             <Row label="지도 밝기">
               <select
                 value={settings.mapTheme}
-                onChange={(e) => update("mapTheme", e.target.value as EbikeSettings["mapTheme"])}
+                onChange={(e) =>
+                  update(
+                    "mapTheme",
+                    e.target.value as EbikeSettings["mapTheme"],
+                  )
+                }
                 className="rounded-lg bg-slate-800 px-2 py-1"
               >
                 <option value="auto">자동 (일몰 후 어둡게)</option>
@@ -2247,9 +2923,10 @@ export default function EbikeApp() {
             📖 사용 안내 다시 보기
           </button>
           <p className="mt-2 text-xs leading-relaxed text-slate-500">
-            아이폰 사용 팁: Safari 공유 버튼 → “홈 화면에 추가”로 앱처럼 쓸 수 있습니다. 웹앱 특성상 화면이
-            꺼지거나 다른 앱으로 전환하면 위치 추적과 음성 안내가 멈추므로, 핸들 거치대에 두고 화면을 켠
-            상태로 사용하세요. 지도 © OpenStreetMap 기여자, 경로 BRouter/OSRM.
+            아이폰 사용 팁: Safari 공유 버튼 → “홈 화면에 추가”로 앱처럼 쓸 수
+            있습니다. 웹앱 특성상 화면이 꺼지거나 다른 앱으로 전환하면 위치
+            추적과 음성 안내가 멈추므로, 핸들 거치대에 두고 화면을 켠 상태로
+            사용하세요. 지도 © OpenStreetMap 기여자, 경로 BRouter/OSRM.
           </p>
         </Sheet>
       )}
@@ -2281,12 +2958,17 @@ function NavBanner({
           className="flex min-w-0 flex-1 items-center gap-3 text-left"
           aria-label="안내 다시 듣기"
         >
-          <div className="w-14 text-center text-5xl leading-none">{TURN_ICON[next?.type ?? "straight"]}</div>
+          <div className="w-14 text-center text-5xl leading-none">
+            {TURN_ICON[next?.type ?? "straight"]}
+          </div>
           <div className="min-w-0 flex-1">
-            <div className="text-2xl font-bold">{formatDistance(distToNext)}</div>
+            <div className="text-2xl font-bold">
+              {formatDistance(distToNext)}
+            </div>
             <div className="truncate text-base">{next?.text ?? "직진"}</div>
             <div className="text-xs text-emerald-100">
-              남은 {formatDistance(progress.remaining)} · {formatEta(progress.etaSec)} 후 도착 (
+              남은 {formatDistance(progress.remaining)} ·{" "}
+              {formatEta(progress.etaSec)} 후 도착 (
               {formatClock(progress.arriveAt)})
             </div>
             <div className="text-[11px] text-emerald-200/80">
@@ -2297,7 +2979,11 @@ function NavBanner({
                   : `기본 속도 ${Math.round(progress.etaKmh)}km/h 기준`}{" "}
               · 🔊 다시 듣기
             </div>
-            {coachText && <div className="mt-0.5 text-xs font-semibold text-yellow-200">🔋 {coachText}</div>}
+            {coachText && (
+              <div className="mt-0.5 text-xs font-semibold text-yellow-200">
+                🔋 {coachText}
+              </div>
+            )}
           </div>
         </button>
         <button
@@ -2309,7 +2995,11 @@ function NavBanner({
         </button>
       </div>
       {showBar && (
-        <div className="h-2 bg-black/30" role="progressbar" aria-label="회전 지점까지 남은 거리">
+        <div
+          className="h-2 bg-black/30"
+          role="progressbar"
+          aria-label="회전 지점까지 남은 거리"
+        >
           <div
             className={`h-full transition-[width] duration-700 ${distToNext <= 60 ? "bg-yellow-300" : "bg-white"}`}
             style={{ width: `${fill * 100}%` }}
@@ -2345,7 +3035,9 @@ function MenuItem({
 
 /** "250미터 앞에서 좌회전" / 카카오 문구에 이미 "~에서"가 있으면 "250미터 앞, 잠실사거리에서 좌회전" */
 function aheadPhrase(dist: number, text: string): string {
-  return /에서/.test(text) ? `${spokenDistance(dist)} 앞, ${text}` : `${spokenDistance(dist)} 앞에서 ${text}`;
+  return /에서/.test(text)
+    ? `${spokenDistance(dist)} 앞, ${text}`
+    : `${spokenDistance(dist)} 앞에서 ${text}`;
 }
 
 function formatClock(ts: number): string {
@@ -2355,7 +3047,8 @@ function formatClock(ts: number): string {
 
 function getCurrentPosition(): Promise<LatLng> {
   return new Promise((resolve, reject) => {
-    if (!("geolocation" in navigator)) return reject(new Error("no geolocation"));
+    if (!("geolocation" in navigator))
+      return reject(new Error("no geolocation"));
     navigator.geolocation.getCurrentPosition(
       (pos) => resolve({ lat: pos.coords.latitude, lng: pos.coords.longitude }),
       reject,
@@ -2366,11 +3059,22 @@ function getCurrentPosition(): Promise<LatLng> {
 
 // ───────────── UI 조각 ─────────────
 
-function GpsBadge({ status, accuracy }: { status: GpsStatus; accuracy: number | null }) {
+function GpsBadge({
+  status,
+  accuracy,
+}: {
+  status: GpsStatus;
+  accuracy: number | null;
+}) {
   const map: Record<GpsStatus, [string, string]> = {
     off: ["bg-slate-500", "GPS 꺼짐"],
     waiting: ["bg-amber-400 animate-pulse", "GPS 수신 중"],
-    on: [accuracy !== null && accuracy > MAX_ACCURACY ? "bg-amber-400" : "bg-emerald-400", "GPS"],
+    on: [
+      accuracy !== null && accuracy > MAX_ACCURACY
+        ? "bg-amber-400"
+        : "bg-emerald-400",
+      "GPS",
+    ],
     error: ["bg-red-500", "GPS 오류"],
   };
   const [color, label] = map[status];
