@@ -59,8 +59,10 @@ import { isNight } from "@/lib/ebike/sun";
 import {
   estimateBattery,
   loadBattery,
+  loadOdometer,
   recordPercent,
   saveBattery,
+  saveOdometer,
   type BatteryState,
 } from "@/lib/ebike/battery";
 import { CrashDetector, requestMotionPermission } from "@/lib/ebike/crash";
@@ -253,6 +255,8 @@ export default function EbikeApp() {
   const [bigSpeed, setBigSpeed] = useState(false);
   const [night, setNight] = useState(() => isNight());
   const [battery, setBattery] = useState<BatteryState>(loadBattery);
+  /** 배터리 계산용 누적 거리 (지난 주행까지, m). null이면 아직 없음 → 저장된 주행 합계로 시작 */
+  const [odoBase, setOdoBase] = useState<number | null>(loadOdometer);
   const lowBatteryRef = useRef<number | null>(null);
   const [weather, setWeather] = useState<Weather | null>(null);
   const [sos, setSos] = useState<"check" | "sos" | null>(null);
@@ -386,10 +390,14 @@ export default function EbikeApp() {
     [],
   );
 
+  /** 주행 기록 없이 켠 GPS·화면 켜짐(걷기 안내)을 정리하는 함수 — 아래에서 연결 */
+  const idleCleanupRef = useRef<() => void>(() => {});
   const stopNavigation = useCallback(() => {
+    const wasNavigating = navRef.current.navigating;
     navRef.current.navigating = false;
     setNavigating(false);
     setProgress(null);
+    if (wasNavigating && rideStatusRef.current === "idle") idleCleanupRef.current();
   }, []);
 
   const clearDestination = useCallback(() => {
@@ -410,7 +418,9 @@ export default function EbikeApp() {
   const estimateEta = useCallback((remaining: number) => {
     const { live, smooth } = etaSpeedRef.current;
     const r = rideRef.current;
-    const rideAvg = r.movingTime > 20 ? (r.distance / r.movingTime) * 3.6 : null;
+    // 걷기 안내에는 자전거 주행 평균을 쓰지 않음
+    const rideAvg =
+      !navRef.current.route?.walk && r.movingTime > 20 ? (r.distance / r.movingTime) * 3.6 : null;
     let kmh: number;
     let basis: EtaBasis;
     if (live > MOVING_KMH && smooth !== null) {
@@ -446,7 +456,12 @@ export default function EbikeApp() {
           nav.rerouting = true;
           nav.lastReroute = now;
           if (settingsRef.current.navVoice) say("경로를 벗어났습니다. 경로를 다시 탐색합니다.", true);
-          computeRoute(nav.destination, p)
+          computeRoute(
+            nav.destination,
+            p,
+            // 배터리 절약 모드는 후보 4개를 다시 비교하지 않고, 고른 경로의 방식으로 빠르게 재탐색
+            r.profile === "battery" ? (r.baseProfile ?? "safety") : undefined,
+          )
             .then((newRoute) => {
               if (newRoute && nav.navigating && settingsRef.current.navVoice) {
                 say(`새 경로로 안내합니다. 목적지까지 ${spokenDistance(newRoute.distance)}입니다.`);
@@ -670,6 +685,14 @@ export default function EbikeApp() {
     overSpeedRef.current.count = 0;
   }, []);
 
+  // 걷기 안내가 끝나면(주행 중이 아닐 때) GPS·화면 켜짐 해제
+  useEffect(() => {
+    idleCleanupRef.current = () => {
+      stopGps();
+      releaseWakeLock();
+    };
+  }, [stopGps, releaseWakeLock]);
+
   useEffect(() => () => stopGps(), [stopGps]);
 
   // ───────────── 주행 기록 저장 ─────────────
@@ -690,7 +713,15 @@ export default function EbikeApp() {
 
   const refreshRides = useCallback(() => {
     listRides()
-      .then(setRides)
+      .then((list) => {
+        setRides(list);
+        // 배터리 주행거리계가 처음 생기면 지금까지 저장된 주행 합계로 시작
+        if (loadOdometer() === null) {
+          const sum = list.reduce((t, x) => t + x.distance, 0);
+          saveOdometer(sum);
+          setOdoBase(sum);
+        }
+      })
       .catch(() => {});
   }, []);
 
@@ -748,6 +779,11 @@ export default function EbikeApp() {
   useEffect(() => {
     takeDraft()
       .then((draft) => {
+        if (draft && draft.distance > 0) {
+          const next = (loadOdometer() ?? 0) + draft.distance;
+          saveOdometer(next);
+          setOdoBase(next);
+        }
         if (draft && draft.distance >= 50) {
           toast.info(`이전 주행(${formatDistance(draft.distance)})을 기록에 저장했습니다.`);
           return persistRide(draft);
@@ -886,8 +922,16 @@ export default function EbikeApp() {
     say("일시 정지");
   };
 
+  /** 배터리 계산용 누적 거리에 이번 주행 거리를 더함 */
+  const addOdometer = (meters: number) => {
+    const next = (loadOdometer() ?? rides.reduce((sum, x) => sum + x.distance, 0)) + meters;
+    saveOdometer(next);
+    setOdoBase(next);
+  };
+
   const endRide = () => {
     const r = rideRef.current;
+    addOdometer(r.distance);
     const avg = r.movingTime > 0 ? (r.distance / r.movingTime) * 3.6 : 0;
     say(`주행을 종료합니다. 총 ${spokenDistance(r.distance)}, 평균 시속 ${Math.round(avg)}킬로미터`, true);
     toast.success(
@@ -1005,9 +1049,15 @@ export default function EbikeApp() {
     const merged = { ...settings, ...next };
     if (next.bikeModel === "tx8pro3") {
       const model = motoveloTx8Pro3(next.speedUnlocked);
-      merged.bikeKg = 26;
-      merged.cruiseSpeed = next.speedUnlocked ? 28 : 20;
-      merged.speedLimit = next.speedUnlocked ? 40 : 25;
+      // 배터리 용량만 바꿀 때는 사용자가 바꾼 무게·속도 설정을 건드리지 않음
+      if (settings.bikeModel !== "tx8pro3") merged.bikeKg = 26;
+      if (settings.bikeModel !== "tx8pro3" || settings.speedUnlocked !== next.speedUnlocked) {
+        merged.cruiseSpeed = next.speedUnlocked ? 28 : 20;
+        merged.speedLimit = next.speedUnlocked ? 40 : 25;
+        toast.info(
+          `속도 경고 ${merged.speedLimit}km/h · 기본 속도 ${merged.cruiseSpeed}km/h로 맞췄습니다 (속도 설정에서 변경 가능)`,
+        );
+      }
       const ref = referenceLevel(model);
       updateBattery({
         ...battery,
@@ -1085,8 +1135,8 @@ export default function EbikeApp() {
   };
 
   // 배터리: 누적 거리(저장된 주행 + 지금 주행) 기준 추정
-  const odometer =
-    rides.reduce((sum, r) => sum + r.distance, 0) + (rideStatus !== "idle" ? ride.distance : 0);
+  const ridesSum = rides.reduce((sum, r) => sum + r.distance, 0);
+  const odometer = (odoBase ?? ridesSum) + (rideStatus !== "idle" ? ride.distance : 0);
   const batteryEst = estimateBattery(battery, odometer);
   // 보조 단계별 배터리 사용량 (오르막·바람·무게 반영)
   const massKg = settings.riderKg + settings.bikeKg;
@@ -1192,7 +1242,8 @@ export default function EbikeApp() {
     if (!route || !destination) return;
     unlockSpeech();
     if (destination.walk) {
-      // 걸어가는 길은 주행 기록 없이 위치만 추적
+      // 걸어가는 길은 주행 기록 없이 위치만 추적 (자전거 속도가 걷기 도착 시간에 섞이지 않게 초기화)
+      etaSpeedRef.current = { live: 0, smooth: null };
       startGps();
       acquireWakeLock();
     } else if (rideStatus !== "riding") startRide();
@@ -2064,7 +2115,8 @@ export default function EbikeApp() {
                   }
                 />
                 <p className="text-xs text-slate-400">
-                  500W 모터 · 20×2.4 팻타이어 · 25.8kg · PAS 3단 + 스로틀 기준으로 계산합니다.
+                  {settings.speedUnlocked ? "속도 경고·기본 속도가 해제 버전 기준으로 바뀝니다. " : ""}500W
+                  모터 · 20×2.4 팻타이어 · 25.8kg · PAS 3단 + 스로틀 기준으로 계산합니다.
                 </p>
               </>
             )}

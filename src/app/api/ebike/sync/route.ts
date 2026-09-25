@@ -57,6 +57,8 @@ export async function POST(req: Request) {
   if (!CODE_RE.test(code)) return bad("동기화 코드 형식이 올바르지 않습니다");
   const ns = `ebike:${createHash("sha256").update(code).digest("hex").slice(0, 32)}`;
 
+  if (body.ids !== undefined && !Array.isArray(body.ids)) return bad("잘못된 주행 id");
+  if (body.rides !== undefined && !Array.isArray(body.rides)) return bad("잘못된 주행 기록");
   const ids = (body.ids ?? []).map(String);
   if (ids.length > MAX_BATCH || ids.some((id) => !ID_RE.test(id))) return bad("잘못된 주행 id");
 

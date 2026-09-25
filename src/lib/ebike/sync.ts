@@ -3,9 +3,11 @@
  */
 import {
   loadDeletedRides,
+  loadRestoredRides,
   loadParking,
   loadPlaces,
   saveDeletedRides,
+  saveRestoredRides,
   saveParking,
   savePlaces,
   type ParkingData,
@@ -133,6 +135,17 @@ function chunks<T>(items: T[], size: number): T[][] {
   return out;
 }
 
+/** 서버 한도(기록 하나 약 900KB)를 넘는 아주 긴 주행은 경로 점을 솎아서 올림 (내 폰의 기록은 그대로) */
+const MAX_RIDE_JSON = 800_000;
+function fitRide(ride: RideRecord): RideRecord {
+  let r = ride;
+  while (JSON.stringify(r).length > MAX_RIDE_JSON && r.points.length > 100) {
+    const pts = r.points;
+    r = { ...r, points: pts.filter((_, i) => i % 2 === 0 || i === pts.length - 1) };
+  }
+  return r;
+}
+
 /** 요청 본문이 너무 커지지 않도록 크기 기준으로 묶음 */
 function chunkBySize(rides: RideRecord[], maxBytes = 2_500_000, maxCount = 20): RideRecord[][] {
   const out: RideRecord[][] = [];
@@ -166,7 +179,9 @@ export async function syncNow(code: string): Promise<SyncResult> {
   saveParking(parking);
 
   // 삭제 기록 합치기 → 양쪽에서 지움
-  const deleted = new Set([...(meta.deleted ?? []), ...loadDeletedRides()]);
+  // 백업으로 되살린 기록은 서버의 삭제 기록보다 우선
+  const restored = new Set(loadRestoredRides());
+  const deleted = new Set([...(meta.deleted ?? []), ...loadDeletedRides()].filter((id) => !restored.has(id)));
   saveDeletedRides([...deleted]);
 
   const localRides = await listRides();
@@ -183,7 +198,16 @@ export async function syncNow(code: string): Promise<SyncResult> {
 
   const localIds = new Set(localRides.map((r) => r.id));
   const toUpload = localRides.filter((r) => !remoteIds.has(r.id) && !deleted.has(r.id));
-  for (const batch of chunkBySize(toUpload)) await api(code, "putRides", { rides: batch });
+  let failed = 0;
+  for (const batch of chunkBySize(toUpload.map(fitRide))) {
+    // 한 묶음이 실패해도 나머지(내려받기·즐겨찾기 동기화)는 계속
+    try {
+      await api(code, "putRides", { rides: batch });
+    } catch (err) {
+      console.warn("주행 기록 올리기 실패", err);
+      failed += batch.length;
+    }
+  }
 
   const toDownload = remote.rideIds.filter((id) => !localIds.has(id) && !deleted.has(id));
   for (const batch of chunks(toDownload, 10)) {
@@ -192,12 +216,13 @@ export async function syncNow(code: string): Promise<SyncResult> {
   }
 
   await api(code, "putMeta", { meta: { places, parking, deleted: [...deleted] } satisfies Meta });
+  saveRestoredRides([]);
   try {
     localStorage.setItem(LAST_SYNC_KEY, String(Date.now()));
   } catch {
     // 무시
   }
-  return { uploaded: toUpload.length, downloaded: toDownload.length, deleted: deletedCount };
+  return { uploaded: toUpload.length - failed, downloaded: toDownload.length, deleted: deletedCount };
 }
 
 // ───────────────────────── 파일 백업 · 복원 ─────────────────────────
@@ -232,14 +257,17 @@ export async function restoreBackup(text: string): Promise<number> {
     throw new Error("전기자전거 백업 파일이 아닙니다");
   }
   const existing = new Set((await listRides()).map((r) => r.id));
-  let added = 0;
+  // 백업에서 되살린 기록은 삭제 목록에서 빼야 다음 동기화 때 다시 지워지지 않음
+  const restored = new Set<string>();
   for (const r of data.rides) {
     if (!r?.id || !Array.isArray(r.points) || existing.has(r.id)) continue;
     await saveRide(r);
-    added++;
+    restored.add(r.id);
   }
   if (data.places) savePlaces(newer(data.places, loadPlaces()));
   if (data.parking) saveParking(newer(data.parking, loadParking()));
-  if (data.deleted) saveDeletedRides([...loadDeletedRides(), ...data.deleted]);
-  return added;
+  const deleted = [...loadDeletedRides(), ...(data.deleted ?? [])].filter((id) => !restored.has(id));
+  saveDeletedRides(deleted);
+  saveRestoredRides([...loadRestoredRides(), ...restored]);
+  return restored.size;
 }

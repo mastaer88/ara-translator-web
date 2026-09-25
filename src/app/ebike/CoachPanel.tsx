@@ -1,7 +1,7 @@
 "use client";
 
 import { formatDistance, formatEta } from "@/lib/ebike/geo";
-import type { CoachAdvice, RouteEnergy } from "@/lib/ebike/energy";
+import { referenceIndex, type CoachAdvice, type RouteEnergy } from "@/lib/ebike/energy";
 import type { Route } from "@/lib/ebike/routing";
 
 type Candidate = { route: Route; energy: RouteEnergy };
@@ -18,7 +18,7 @@ type Props = {
 };
 
 /** 기준 단계(가운데) 사용량 */
-const normalWh = (e: RouteEnergy) => e.levels[Math.floor((e.levels.length - 1) / 2)].wh;
+const normalWh = (e: RouteEnergy) => e.levels[referenceIndex(e.levels.length)].wh;
 
 export default function CoachPanel({
   candidates,

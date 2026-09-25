@@ -61,6 +61,8 @@ export type Route = {
   elev?: number[];
   /** 경로 비교 화면에 보일 이름 */
   label?: string;
+  /** 배터리 절약 후보를 만든 BRouter 방식 (경로 이탈 시 이 방식으로 빠르게 재탐색) */
+  baseProfile?: RouteProfile;
 };
 
 export type Place = { name: string; detail: string; location: LatLng; distance?: number | null };
@@ -489,9 +491,11 @@ export async function findBatteryCandidates(from: LatLng, to: LatLng): Promise<R
     ["safety", 1, "다른 길"],
   ];
   const results = await Promise.allSettled(
-    tries.map(([p, alt, label]) => routeWithBRouter(from, to, p, alt).then((r) => ({ ...r, label }))),
+    tries.map(([p, alt, label]) =>
+      routeWithBRouter(from, to, p, alt).then((r) => ({ ...r, label, baseProfile: p })),
+    ),
   );
-  let routes = results.flatMap((r) => (r.status === "fulfilled" ? [r.value] : []));
+  let routes: Route[] = results.flatMap((r) => (r.status === "fulfilled" ? [r.value] : []));
   if (routes.length === 0) routes = [{ ...(await routeWithOsrm(from, to, "battery")), label: "기본 경로" }];
 
   // 거리 1% · 좌표가 거의 같은 경로는 중복으로 보고 제거
