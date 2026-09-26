@@ -121,7 +121,10 @@ export default function HistorySheet(props: Props) {
                 <li key={r.id} className="overflow-hidden rounded-xl bg-slate-800/60">
                   <button className="w-full p-3 text-left" onClick={() => setOpenId(open ? null : r.id)}>
                     <div className="flex items-baseline justify-between gap-2">
-                      <span className="text-sm text-slate-300">{dateLabel(r.startedAt)}</span>
+                      <span className="text-sm text-slate-300">
+                        {r.vehicle === "moto" && "🏍 "}
+                        {dateLabel(r.startedAt)}
+                      </span>
                       <span className="font-mono text-lg font-bold">{formatDistance(r.distance)}</span>
                     </div>
                     <div className="truncate text-xs text-slate-400">

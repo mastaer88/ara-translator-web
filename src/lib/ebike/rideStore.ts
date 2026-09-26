@@ -17,6 +17,8 @@ export type RideRecord = {
   points: TrackPoint[];
   startName?: string;
   endName?: string;
+  /** 오토바이로 달린 기록 (없으면 전기자전거) */
+  vehicle?: "moto";
 };
 
 export type RideTotals = {
