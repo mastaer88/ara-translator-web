@@ -87,7 +87,39 @@ import {
   listenOnce,
   parseCommand,
 } from "@/lib/ebike/voiceCommand";
-import { loadSettings, saveSettings, type EbikeSettings } from "./settings";
+import {
+  addMotoOdo,
+  dashboardKm,
+  dueItems,
+  estimateFuel,
+  fuelAfter,
+  loadDashboard,
+  loadFuel,
+  loadMaint,
+  loadMotoOdo,
+  saveDashboard,
+  saveFuel,
+  saveMaint,
+  type Dashboard,
+  type FuelState,
+  type MaintItem,
+} from "@/lib/ebike/moto";
+import {
+  CameraWatcher,
+  cameraPhrase,
+  loadCameras,
+  parseCameras,
+  readTextFile,
+  saveCameras,
+} from "@/lib/ebike/cameras";
+import {
+  VEHICLE_SPEEDS,
+  loadSettings,
+  saveSettings,
+  type EbikeSettings,
+  type Vehicle,
+} from "./settings";
+import MotoSheet from "./MotoSheet";
 import BatterySheet from "./BatterySheet";
 import CoachPanel from "./CoachPanel";
 import {
@@ -273,7 +305,14 @@ export default function EbikeApp() {
 
   // 화면
   const [sheet, setSheet] = useState<
-    "nav" | "settings" | "history" | "location" | "parking" | "battery" | null
+    | "nav"
+    | "settings"
+    | "history"
+    | "location"
+    | "parking"
+    | "battery"
+    | "moto"
+    | null
   >(null);
   const [places, setPlaces] = useState<PlacesData>(loadPlaces);
   const [parkingData, setParkingData] = useState<ParkingData>(loadParking);
@@ -302,6 +341,18 @@ export default function EbikeApp() {
   /** 배터리 계산용 누적 거리 (지난 주행까지, m). null이면 아직 없음 → 저장된 주행 합계로 시작 */
   const [odoBase, setOdoBase] = useState<number | null>(loadOdometer);
   const lowBatteryRef = useRef<number | null>(null);
+  // 오토바이: 누적 거리·연료·계기판·정비·단속 카메라
+  const [motoOdoBase, setMotoOdoBase] = useState<number>(loadMotoOdo);
+  const [fuel, setFuel] = useState<FuelState>(loadFuel);
+  const [dash, setDash] = useState<Dashboard>(loadDashboard);
+  const [maint, setMaint] = useState<MaintItem[]>(loadMaint);
+  const [cameraData, setCameraData] = useState(loadCameras);
+  const cameraWatcherRef = useRef<CameraWatcher | null>(null);
+  useEffect(() => {
+    cameraWatcherRef.current = cameraData.cameras.length
+      ? new CameraWatcher(cameraData.cameras)
+      : null;
+  }, [cameraData]);
   const [weather, setWeather] = useState<Weather | null>(null);
   const [sos, setSos] = useState<"check" | "sos" | null>(null);
   const [sosAddress, setSosAddress] = useState<string | null>(null);
@@ -392,7 +443,12 @@ export default function EbikeApp() {
       }
       setRouting(true);
       try {
-        const prof = profile ?? settingsRef.current.profile;
+        // 오토바이는 항상 이륜차 경로 (고속도로·자동차전용도로·자전거도로 제외)
+        const prof =
+          profile ??
+          (settingsRef.current.vehicle === "moto"
+            ? "moto"
+            : settingsRef.current.profile);
         let r: Route;
         if (!dest.walk && prof === "battery") {
           // 여러 경로의 배터리 사용량(보통 단계)을 계산해 가장 적은 경로 선택
@@ -728,6 +784,24 @@ export default function EbikeApp() {
         setHeading(rawHeading);
       // 방향 정보가 없으면 직전 위치에서 이동한 방향으로 계산
       else if (last && step >= 5 && kmh > 3) setHeading(bearing(last.p, p));
+
+      // 오토바이: 앞쪽 단속 카메라 음성 경고
+      const cams = cameraWatcherRef.current;
+      if (
+        cams &&
+        s.vehicle === "moto" &&
+        s.cameraWarn &&
+        rideStatusRef.current === "riding"
+      ) {
+        const moveHeading =
+          rawHeading !== null && !Number.isNaN(rawHeading) && rawHeading >= 0
+            ? rawHeading
+            : last && step >= 5
+              ? bearing(last.p, p)
+              : null;
+        for (const a of cams.update(p, moveHeading, kmh))
+          say(cameraPhrase(a, spokenDistance), a.kind === "slow");
+      }
       positionRef.current = p;
       setGpsStatus("on");
 
@@ -856,6 +930,9 @@ export default function EbikeApp() {
       elapsed: r.elapsed,
       maxSpeed: r.maxSpeed,
       points: [...trackRef.current],
+      ...(settingsRef.current.vehicle === "moto"
+        ? { vehicle: "moto" as const }
+        : {}),
     };
   }, []);
 
@@ -1064,6 +1141,21 @@ export default function EbikeApp() {
       setViewing(null);
       setRide({ ...rideRef.current });
       say("주행을 시작합니다.");
+      const s0 = settingsRef.current;
+      if (s0.vehicle === "moto" && s0.maintEnabled) {
+        const due = dueItems(
+          loadMaint(),
+          dashboardKm(loadDashboard(), loadMotoOdo()),
+        );
+        if (due.length) {
+          const names = due.map((d) => d.name).join(", ");
+          say(`${names} 정비할 때가 되었습니다.`);
+          toast.warning(`🔧 정비할 때: ${names}`, {
+            duration: 8000,
+            action: { label: "보기", onClick: () => setSheet("moto") },
+          });
+        }
+      }
     } else {
       say("주행을 다시 시작합니다.");
     }
@@ -1086,7 +1178,9 @@ export default function EbikeApp() {
 
   const endRide = () => {
     const r = rideRef.current;
-    addOdometer(r.distance);
+    if (settingsRef.current.vehicle === "moto")
+      setMotoOdoBase(addMotoOdo(r.distance));
+    else addOdometer(r.distance);
     const avg = r.movingTime > 0 ? (r.distance / r.movingTime) * 3.6 : 0;
     say(
       `주행을 종료합니다. 총 ${spokenDistance(r.distance)}, 평균 시속 ${Math.round(avg)}킬로미터`,
@@ -1345,16 +1439,85 @@ export default function EbikeApp() {
     });
   };
 
+  // ───────────── 차종 (전기자전거 / 오토바이) ─────────────
+  const setVehicle = (v: Vehicle) => {
+    if (v === settings.vehicle) return;
+    const savedSpeeds = {
+      ...settings.savedSpeeds,
+      [settings.vehicle]: {
+        speedLimit: settings.speedLimit,
+        cruiseSpeed: settings.cruiseSpeed,
+      },
+    };
+    const next = {
+      ...settings,
+      vehicle: v,
+      savedSpeeds,
+      ...(savedSpeeds[v] ?? VEHICLE_SPEEDS[v]),
+    };
+    setSettings(next);
+    settingsRef.current = next;
+    toast.success(
+      v === "moto"
+        ? "🏍 오토바이 모드: 고속도로·자동차전용도로·자전거도로를 빼고 길을 찾습니다"
+        : "🚲 전기자전거 모드",
+    );
+    // 이미 고른 목적지가 있으면 새 차종에 맞는 길로 다시 찾기
+    if (destination && !destination.walk)
+      computeRoute(
+        destination,
+        null,
+        v === "moto"
+          ? "moto"
+          : settings.profile === "moto"
+            ? "safety"
+            : settings.profile,
+      );
+  };
+
+  const importCameras = async (file: File) => {
+    try {
+      const cameras = parseCameras(await readTextFile(file));
+      if (cameras.length === 0) {
+        toast.error("파일에서 카메라 위치를 찾지 못했습니다.");
+        return;
+      }
+      if (!saveCameras(cameras))
+        toast.warning("기기 저장 공간이 부족해 이번 실행 중에만 사용합니다.");
+      setCameraData({ cameras, importedAt: nowMs() });
+      toast.success(
+        `단속 카메라 ${cameras.length.toLocaleString()}개를 불러왔습니다`,
+      );
+    } catch (err) {
+      toast.error(
+        `파일을 읽지 못했습니다: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  };
+
   const changeProfile = (profile: RouteProfile) => {
     update("profile", profile);
     if (destination) computeRoute(destination, null, profile);
   };
 
   // 배터리: 누적 거리(저장된 주행 + 지금 주행) 기준 추정
-  const ridesSum = rides.reduce((sum, r) => sum + r.distance, 0);
+  const isMoto = settings.vehicle === "moto";
+  const ridesSum = rides.reduce(
+    (sum, r) => sum + (r.vehicle === "moto" ? 0 : r.distance),
+    0,
+  );
   const odometer =
-    (odoBase ?? ridesSum) + (rideStatus !== "idle" ? ride.distance : 0);
+    (odoBase ?? ridesSum) +
+    (rideStatus !== "idle" && !isMoto ? ride.distance : 0);
   const batteryEst = estimateBattery(battery, odometer);
+  // 오토바이: 연료로 주행 가능 거리
+  const motoOdo =
+    motoOdoBase + (rideStatus !== "idle" && isMoto ? ride.distance : 0);
+  const fuelEst = isMoto ? estimateFuel(fuel, motoOdo) : null;
+  /** 지금 차종의 에너지 (전기자전거: 배터리, 오토바이: 연료) */
+  const tank = isMoto ? fuelEst : batteryEst;
+  const tankWord = isMoto ? "연료" : "배터리";
+  const tankIcon = isMoto ? "⛽" : "🔋";
   // 보조 단계별 배터리 사용량 (오르막·바람·무게 반영)
   const massKg = settings.riderKg + settings.bikeKg;
   const bikeModel = useMemo(
@@ -1369,7 +1532,7 @@ export default function EbikeApp() {
   );
   const routeEnergyNow = useMemo(
     () =>
-      route && !route.walk
+      route && !route.walk && !isMoto
         ? routeEnergy(route.coords, route.elev ?? null, {
             massKg,
             whPerKm: battery.whPerKm,
@@ -1377,7 +1540,7 @@ export default function EbikeApp() {
             model: bikeModel,
           })
         : null,
-    [route, massKg, battery.whPerKm, windOpt, bikeModel],
+    [route, massKg, battery.whPerKm, windOpt, bikeModel, isMoto],
   );
   const candidateEnergies = useMemo(
     () =>
@@ -1410,12 +1573,16 @@ export default function EbikeApp() {
       capacity: battery.capacityWh,
     };
   });
-  const routeBatteryLeft = advice
-    ? advice.arrivePercent[referenceLevel(bikeModel).id]
-    : batteryEst && route
-      ? batteryEst.percent -
-        ((route.distance / 1000) * battery.whPerKm * 100) / battery.capacityWh
-      : null;
+  const routeBatteryLeft = isMoto
+    ? fuelEst && route
+      ? fuelAfter(fuel, fuelEst, route.distance)
+      : null
+    : advice
+      ? advice.arrivePercent[referenceLevel(bikeModel).id]
+      : batteryEst && route
+        ? batteryEst.percent -
+          ((route.distance / 1000) * battery.whPerKm * 100) / battery.capacityWh
+        : null;
   const routeWind =
     weather && route && route.coords.length > 1
       ? headwind(
@@ -1425,10 +1592,10 @@ export default function EbikeApp() {
       : null;
 
   // 배터리 20% · 10% 아래로 내려가면 음성 경고 (주행 중 한 번씩)
-  const lowLevel = batteryEst
-    ? batteryEst.percent <= 10
+  const lowLevel = tank
+    ? tank.percent <= 10
       ? 10
-      : batteryEst.percent <= 20
+      : tank.percent <= 20
         ? 20
         : null
     : null;
@@ -1437,20 +1604,18 @@ export default function EbikeApp() {
       lowBatteryRef.current = null;
       return;
     }
-    if (
-      rideStatus !== "riding" ||
-      lowBatteryRef.current === lowLevel ||
-      !batteryEst
-    )
+    if (rideStatus !== "riding" || lowBatteryRef.current === lowLevel || !tank)
       return;
     lowBatteryRef.current = lowLevel;
     say(
-      `배터리가 약 ${lowLevel}퍼센트 남았습니다. 약 ${Math.round(batteryEst.rangeKm)}킬로미터 더 갈 수 있습니다.`,
+      `${tankWord}가 약 ${lowLevel}퍼센트 남았습니다. 약 ${Math.round(tank.rangeKm)}킬로미터 더 갈 수 있습니다.`,
     );
-  }, [lowLevel, rideStatus, batteryEst, say]);
+  }, [lowLevel, rideStatus, tank, tankWord, say]);
 
   // 안내 시작 전 예상 시간: 지금 달리는 중이면 현재 속도, 아니면 최근 주행 평균, 없으면 기본 속도
-  const recent = rides.slice(0, 10);
+  const recent = rides
+    .filter((r) => (r.vehicle === "moto") === isMoto)
+    .slice(0, 10);
   const recentMoving = recent.reduce((t, r) => t + r.movingTime, 0);
   const recentAvg =
     recentMoving > 60
@@ -1525,7 +1690,11 @@ export default function EbikeApp() {
       if (coachSpeech) {
         say(coachSpeech);
       } else if (routeBatteryLeft !== null && routeBatteryLeft < 10)
-        say("배터리가 부족할 수 있습니다. 충전 상태를 확인하세요.");
+        say(
+          isMoto
+            ? "연료가 부족할 수 있습니다. 주유소를 들러 가세요."
+            : "배터리가 부족할 수 있습니다. 충전 상태를 확인하세요.",
+        );
       if (weather && weather.rainChance >= 50)
         say(`3시간 안에 비 올 확률 ${weather.rainChance}퍼센트입니다.`);
       if (routeWind !== null && routeWind >= 4)
@@ -1617,12 +1786,14 @@ export default function EbikeApp() {
         });
       }
       case "battery":
-        if (!batteryEst)
+        if (!tank)
           return reply(
-            "배터리를 아직 설정하지 않았습니다. 배터리 화면에서 충전 상태를 입력해 주세요.",
+            isMoto
+              ? "연료를 아직 입력하지 않았습니다. 오토바이 화면에서 가득 주유나 연료 눈금을 입력해 주세요."
+              : "배터리를 아직 설정하지 않았습니다. 배터리 화면에서 충전 상태를 입력해 주세요.",
           );
         return reply(
-          `배터리는 약 ${Math.round(batteryEst.percent)}퍼센트, 약 ${Math.round(batteryEst.rangeKm)}킬로미터 더 갈 수 있습니다.` +
+          `${tankWord}는 약 ${Math.round(tank.percent)}퍼센트, 약 ${Math.round(tank.rangeKm)}킬로미터 더 갈 수 있습니다.` +
             (routeBatteryLeft !== null && route && !route.walk
               ? ` 목적지 도착 시 약 ${Math.max(0, Math.round(routeBatteryLeft))}퍼센트 남습니다.`
               : ""),
@@ -1867,12 +2038,12 @@ export default function EbikeApp() {
               누적 {(totalDistance / 1000).toFixed(1)}km
             </button>
             <button
-              onClick={() => setSheet("battery")}
+              onClick={() => setSheet(isMoto ? "moto" : "battery")}
               className="tabular-nums"
             >
-              {batteryEst
-                ? `🔋${Math.round(batteryEst.percent)}% · ${Math.round(batteryEst.rangeKm)}km`
-                : "🔋 입력"}
+              {tank
+                ? `${tankIcon}${Math.round(tank.percent)}% · ${Math.round(tank.rangeKm)}km`
+                : `${tankIcon} 입력`}
             </button>
             {weather ? (
               <button onClick={showWeather} className="tabular-nums">
@@ -2221,7 +2392,11 @@ export default function EbikeApp() {
             주변 찾기 (가까운 순)
           </div>
           <div className="mt-1 flex gap-2 overflow-x-auto pb-1">
-            {NEARBY_KINDS.map((k) => (
+            {NEARBY_KINDS.filter((k) =>
+              isMoto
+                ? k.id !== "repair"
+                : k.id !== "OL7" && k.id !== "moto-repair",
+            ).map((k) => (
               <button
                 key={k.id}
                 onClick={() => findNearby(k)}
@@ -2317,24 +2492,34 @@ export default function EbikeApp() {
             {destination?.walk &&
               " · 🚶 주차 위치까지는 걷기 경로로 안내합니다"}
           </div>
-          <div className="mt-1 grid grid-cols-2 gap-2">
-            {(Object.keys(PROFILE_LABELS) as RouteProfile[]).map((p) => (
-              <button
-                key={p}
-                onClick={() => changeProfile(p)}
-                className={`rounded-xl px-2 py-2 text-sm ${
-                  settings.profile === p
-                    ? "bg-emerald-600 font-semibold"
-                    : "bg-slate-800 text-slate-300"
-                }`}
-              >
-                {PROFILE_LABELS[p].name}
-              </button>
-            ))}
-          </div>
-          <p className="mt-1 text-xs text-slate-500">
-            {PROFILE_LABELS[settings.profile].desc}
-          </p>
+          {isMoto ? (
+            <p className="mt-1 rounded-xl bg-slate-800 px-3 py-2 text-sm text-slate-300">
+              🏍 오토바이 경로 — {PROFILE_LABELS.moto.desc}
+            </p>
+          ) : (
+            <>
+              <div className="mt-1 grid grid-cols-2 gap-2">
+                {(Object.keys(PROFILE_LABELS) as RouteProfile[])
+                  .filter((p) => p !== "moto")
+                  .map((p) => (
+                    <button
+                      key={p}
+                      onClick={() => changeProfile(p)}
+                      className={`rounded-xl px-2 py-2 text-sm ${
+                        settings.profile === p
+                          ? "bg-emerald-600 font-semibold"
+                          : "bg-slate-800 text-slate-300"
+                      }`}
+                    >
+                      {PROFILE_LABELS[p].name}
+                    </button>
+                  ))}
+              </div>
+              <p className="mt-1 text-xs text-slate-500">
+                {PROFILE_LABELS[settings.profile].desc}
+              </p>
+            </>
+          )}
 
           {destination && (
             <div className="mt-4 rounded-xl bg-slate-800/60 p-3">
@@ -2469,7 +2654,7 @@ export default function EbikeApp() {
                             : "text-slate-300"
                         }
                       >
-                        🔋 도착 시 예상 배터리{" "}
+                        {tankIcon} 도착 시 예상 {tankWord}{" "}
                         {Math.max(0, Math.round(routeBatteryLeft))}%
                         {routeBatteryLeft < 10 && " — 부족할 수 있어요"}
                       </li>
@@ -2525,6 +2710,39 @@ export default function EbikeApp() {
             setOnboarding(false);
             setSheet("settings");
           }}
+        />
+      )}
+
+      {/* ───── 오토바이 시트 (연료·정비·카메라) ───── */}
+      {sheet === "moto" && (
+        <MotoSheet
+          fuel={fuel}
+          appOdo={motoOdo}
+          dash={dash}
+          maint={maint}
+          maintEnabled={settings.maintEnabled}
+          cameraCount={cameraData.cameras.length}
+          cameraImportedAt={cameraData.importedAt}
+          onFuel={(f, message) => {
+            saveFuel(f);
+            setFuel(f);
+            if (message) toast.success(message);
+          }}
+          onDash={(d) => {
+            saveDashboard(d);
+            setDash(d);
+            toast.success(`계기판 ${d.km?.toLocaleString()}km로 맞췄습니다`);
+          }}
+          onMaint={(items) => {
+            saveMaint(items);
+            setMaint(items);
+          }}
+          onImportCameras={importCameras}
+          onClearCameras={() => {
+            saveCameras([]);
+            setCameraData({ cameras: [], importedAt: null });
+          }}
+          onClose={() => setSheet(null)}
         />
       )}
 
@@ -2610,6 +2828,49 @@ export default function EbikeApp() {
       {/* ───── 설정 시트 ───── */}
       {sheet === "settings" && (
         <Sheet title="설정" onClose={() => setSheet(null)}>
+          <Section title="차종">
+            <div className="grid grid-cols-2 gap-2">
+              {(["ebike", "moto"] as const).map((v) => (
+                <button
+                  key={v}
+                  onClick={() => setVehicle(v)}
+                  aria-pressed={settings.vehicle === v}
+                  className={`rounded-xl py-3 text-sm ${
+                    settings.vehicle === v
+                      ? "bg-emerald-600 font-semibold"
+                      : "bg-slate-800 text-slate-300"
+                  }`}
+                >
+                  {v === "ebike" ? "🚲 전기자전거" : "🏍 오토바이"}
+                </button>
+              ))}
+            </div>
+            {isMoto && (
+              <>
+                <p className="text-xs text-slate-400">
+                  길찾기에서 고속도로·자동차전용도로·자전거도로를 빼고, 배터리
+                  대신 연료로 주행 가능 거리를 계산합니다.
+                </p>
+                <Toggle
+                  label="정비 알림 (엔진오일 등)"
+                  value={settings.maintEnabled}
+                  onChange={(v) => update("maintEnabled", v)}
+                />
+                <Toggle
+                  label={`단속 카메라 음성 경고${cameraData.cameras.length ? "" : " (데이터 필요)"}`}
+                  value={settings.cameraWarn}
+                  onChange={(v) => update("cameraWarn", v)}
+                />
+                <button
+                  onClick={() => setSheet("moto")}
+                  className="w-full rounded-lg bg-slate-700 py-2 text-sm"
+                >
+                  ⛽ 연료 · 🔧 정비 · 📷 카메라 관리
+                </button>
+              </>
+            )}
+          </Section>
+
           <Section title="음성 안내">
             <Toggle
               label="음성 안내 사용"
@@ -2717,101 +2978,103 @@ export default function EbikeApp() {
             </button>
           </Section>
 
-          <Section title="내 자전거">
-            <Row label="모델">
-              <select
-                value={settings.bikeModel}
-                onChange={(e) =>
-                  applyBike({
-                    bikeModel: e.target.value as EbikeSettings["bikeModel"],
-                    tx8BatteryAh: settings.tx8BatteryAh,
-                    speedUnlocked: settings.speedUnlocked,
-                  })
-                }
-                className="rounded-lg bg-slate-800 px-2 py-1"
-              >
-                <option value="custom">직접 입력</option>
-                <option value="tx8pro3">모토벨로 TX8 PRO3</option>
-              </select>
-            </Row>
-            {settings.bikeModel === "tx8pro3" && (
-              <>
-                <Row label="배터리 (48V)">
-                  <select
-                    value={settings.tx8BatteryAh}
-                    onChange={(e) =>
-                      applyBike({
-                        bikeModel: "tx8pro3",
-                        tx8BatteryAh: Number(e.target.value) as 15 | 20,
-                        speedUnlocked: settings.speedUnlocked,
-                      })
-                    }
-                    className="rounded-lg bg-slate-800 px-2 py-1"
-                  >
-                    <option value={15}>15Ah (720Wh)</option>
-                    <option value={20}>20Ah (960Wh)</option>
-                  </select>
-                </Row>
-                <Toggle
-                  label="속도 제한 해제 버전"
-                  value={settings.speedUnlocked}
-                  onChange={(v) =>
+          {!isMoto && (
+            <Section title="내 자전거">
+              <Row label="모델">
+                <select
+                  value={settings.bikeModel}
+                  onChange={(e) =>
                     applyBike({
-                      bikeModel: "tx8pro3",
+                      bikeModel: e.target.value as EbikeSettings["bikeModel"],
                       tx8BatteryAh: settings.tx8BatteryAh,
-                      speedUnlocked: v,
+                      speedUnlocked: settings.speedUnlocked,
                     })
                   }
-                />
-                <p className="text-xs text-slate-400">
-                  {settings.speedUnlocked
-                    ? "속도 경고·기본 속도가 해제 버전 기준으로 바뀝니다. "
-                    : ""}
-                  500W 모터 · 20×2.4 팻타이어 · 25.8kg · PAS 3단 + 스로틀
-                  기준으로 계산합니다.
-                </p>
-              </>
-            )}
-            <Slider
-              label={`내 몸무게 ${settings.riderKg}kg`}
-              min={30}
-              max={140}
-              step={1}
-              value={settings.riderKg}
-              onChange={(v) => update("riderKg", v)}
-            />
-            <Slider
-              label={`자전거 무게 ${settings.bikeKg}kg (짐 포함)`}
-              min={12}
-              max={60}
-              step={1}
-              value={settings.bikeKg}
-              onChange={(v) => update("bikeKg", v)}
-            />
-            <div>
-              <div className="mb-1 text-xs text-slate-400">
-                완충 시 평지 주행 가능 거리 (배터리 {battery.capacityWh}Wh ·
-                무풍)
+                  className="rounded-lg bg-slate-800 px-2 py-1"
+                >
+                  <option value="custom">직접 입력</option>
+                  <option value="tx8pro3">모토벨로 TX8 PRO3</option>
+                </select>
+              </Row>
+              {settings.bikeModel === "tx8pro3" && (
+                <>
+                  <Row label="배터리 (48V)">
+                    <select
+                      value={settings.tx8BatteryAh}
+                      onChange={(e) =>
+                        applyBike({
+                          bikeModel: "tx8pro3",
+                          tx8BatteryAh: Number(e.target.value) as 15 | 20,
+                          speedUnlocked: settings.speedUnlocked,
+                        })
+                      }
+                      className="rounded-lg bg-slate-800 px-2 py-1"
+                    >
+                      <option value={15}>15Ah (720Wh)</option>
+                      <option value={20}>20Ah (960Wh)</option>
+                    </select>
+                  </Row>
+                  <Toggle
+                    label="속도 제한 해제 버전"
+                    value={settings.speedUnlocked}
+                    onChange={(v) =>
+                      applyBike({
+                        bikeModel: "tx8pro3",
+                        tx8BatteryAh: settings.tx8BatteryAh,
+                        speedUnlocked: v,
+                      })
+                    }
+                  />
+                  <p className="text-xs text-slate-400">
+                    {settings.speedUnlocked
+                      ? "속도 경고·기본 속도가 해제 버전 기준으로 바뀝니다. "
+                      : ""}
+                    500W 모터 · 20×2.4 팻타이어 · 25.8kg · PAS 3단 + 스로틀
+                    기준으로 계산합니다.
+                  </p>
+                </>
+              )}
+              <Slider
+                label={`내 몸무게 ${settings.riderKg}kg`}
+                min={30}
+                max={140}
+                step={1}
+                value={settings.riderKg}
+                onChange={(v) => update("riderKg", v)}
+              />
+              <Slider
+                label={`자전거 무게 ${settings.bikeKg}kg (짐 포함)`}
+                min={12}
+                max={60}
+                step={1}
+                value={settings.bikeKg}
+                onChange={(v) => update("bikeKg", v)}
+              />
+              <div>
+                <div className="mb-1 text-xs text-slate-400">
+                  완충 시 평지 주행 가능 거리 (배터리 {battery.capacityWh}Wh ·
+                  무풍)
+                </div>
+                <div className="grid grid-cols-4 gap-1 text-center">
+                  {bikeModel.levels.map((l) => {
+                    const scale =
+                      battery.whPerKm /
+                      flatWhPerKm(bikeModel, referenceLevel(bikeModel), massKg);
+                    const km =
+                      battery.capacityWh /
+                      (flatWhPerKm(bikeModel, l, massKg) * scale);
+                    return (
+                      <Stat
+                        key={l.id}
+                        label={`${l.name} · ${l.kmh}km/h`}
+                        value={`${Math.round(km)}km`}
+                      />
+                    );
+                  })}
+                </div>
               </div>
-              <div className="grid grid-cols-4 gap-1 text-center">
-                {bikeModel.levels.map((l) => {
-                  const scale =
-                    battery.whPerKm /
-                    flatWhPerKm(bikeModel, referenceLevel(bikeModel), massKg);
-                  const km =
-                    battery.capacityWh /
-                    (flatWhPerKm(bikeModel, l, massKg) * scale);
-                  return (
-                    <Stat
-                      key={l.id}
-                      label={`${l.name} · ${l.kmh}km/h`}
-                      value={`${Math.round(km)}km`}
-                    />
-                  );
-                })}
-              </div>
-            </div>
-          </Section>
+            </Section>
+          )}
 
           <Section title="속도">
             <Toggle
@@ -2821,16 +3084,16 @@ export default function EbikeApp() {
             />
             <Slider
               label={`제한 속도 ${settings.speedLimit}km/h`}
-              min={10}
-              max={45}
-              step={1}
+              min={isMoto ? 30 : 10}
+              max={isMoto ? 130 : 45}
+              step={isMoto ? 5 : 1}
               value={settings.speedLimit}
               onChange={(v) => update("speedLimit", v)}
             />
             <Slider
               label={`기본 속도 ${settings.cruiseSpeed}km/h (주행 기록이 없을 때 도착 시간 계산)`}
-              min={10}
-              max={35}
+              min={isMoto ? 15 : 10}
+              max={isMoto ? 80 : 35}
               step={1}
               value={settings.cruiseSpeed}
               onChange={(v) => update("cruiseSpeed", v)}

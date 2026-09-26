@@ -23,7 +23,9 @@ export type VoiceCommand =
 const NEARBY_WORDS: [RegExp, string][] = [
   [/편의점/, "CS2"],
   [/화장실/, "toilet"],
+  [/(오토바이|바이크|이륜차)\s*(수리|정비|센터|샵)/, "moto-repair"],
   [/(자전거\s*)?(수리|정비|수리점|펑크)/, "repair"],
+  [/(주유소|기름\s*넣)/, "OL7"],
   [/(카페|커피)/, "CE7"],
   [/(음식점|식당|밥\s*집|맛집)/, "FD6"],
   [/(지하철|전철)/, "SW8"],
@@ -52,7 +54,8 @@ export function parseCommand(raw: string): VoiceCommand {
   if (/주행.*(종료|끝|그만|마쳐|마칠)/.test(t)) return { type: "endRide" };
   if (/(주행.*(시작|출발)|^출발)/.test(t)) return { type: "startRide" };
 
-  if (/배터리|충전|잔량/.test(t)) return { type: "battery" };
+  // 주유소 찾기는 아래 주변 찾기로
+  if (/배터리|충전|잔량|연료|기름\s*(얼마|남)/.test(t)) return { type: "battery" };
   if (/날씨|비\s*(와|올|오)|바람/.test(t)) return { type: "weather" };
   if (/(도착|남은\s*거리|얼마나\s*남|몇\s*시|언제)/.test(t))
     return { type: "eta" };

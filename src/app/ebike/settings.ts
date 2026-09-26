@@ -39,6 +39,22 @@ export type EbikeSettings = {
   tx8BatteryAh: 15 | 20;
   /** 속도 제한 해제 개조 버전 */
   speedUnlocked: boolean;
+  /** 차종: 전기자전거 / 오토바이 (엔진) */
+  vehicle: Vehicle;
+  /** 차종을 바꿀 때 서로의 제한·기본 속도를 따로 기억 */
+  savedSpeeds: Partial<Record<Vehicle, { speedLimit: number; cruiseSpeed: number }>>;
+  /** 오토바이 정비 알림 */
+  maintEnabled: boolean;
+  /** 오토바이 단속 카메라 음성 경고 */
+  cameraWarn: boolean;
+};
+
+export type Vehicle = "ebike" | "moto";
+
+/** 차종별 처음 속도 (오토바이: 도심 기준) */
+export const VEHICLE_SPEEDS: Record<Vehicle, { speedLimit: number; cruiseSpeed: number }> = {
+  ebike: { speedLimit: 25, cruiseSpeed: 20 },
+  moto: { speedLimit: 80, cruiseSpeed: 35 },
 };
 
 export const DEFAULT_SETTINGS: EbikeSettings = {
@@ -66,6 +82,10 @@ export const DEFAULT_SETTINGS: EbikeSettings = {
   bikeModel: "custom",
   tx8BatteryAh: 15,
   speedUnlocked: false,
+  vehicle: "ebike",
+  savedSpeeds: {},
+  maintEnabled: true,
+  cameraWarn: true,
 };
 
 const KEY = "ebike-settings-v1";

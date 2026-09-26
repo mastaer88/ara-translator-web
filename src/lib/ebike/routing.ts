@@ -6,7 +6,7 @@ import { cumulativeDistances, haversine, projectOnRoute, type LatLng } from "./g
  * - trekking: 자전거도로 선호 + 거리 균형
  * - fastbike: 빠른 도로 위주 (차도 포함)
  */
-export type RouteProfile = "safety" | "trekking" | "fastbike" | "kakao" | "battery";
+export type RouteProfile = "safety" | "trekking" | "fastbike" | "kakao" | "battery" | "moto";
 
 export const PROFILE_LABELS: Record<RouteProfile, { name: string; desc: string }> = {
   safety: { name: "자전거도로 우선", desc: "자전거 전용·겸용도로를 최대한 이용" },
@@ -17,6 +17,7 @@ export const PROFILE_LABELS: Record<RouteProfile, { name: string; desc: string }
     name: "🔋 배터리 절약",
     desc: "여러 경로의 오르막·거리·바람을 계산해 배터리를 가장 적게 쓰는 길",
   },
+  moto: { name: "오토바이", desc: "고속도로·자동차전용도로·자전거도로를 빼고 찾음" },
 };
 
 export type TurnType =
@@ -227,6 +228,14 @@ type BRouterGeoJson = {
 const CYCLE_TAG =
   /highway=cycleway|bicycle=designated|cycleway(:\w+)?=(lane|track|shared_lane)|route_bicycle_/;
 
+/** 오토바이 경로 점검: 고속도로·자동차전용도로 구간이 들어 있는지 (지도 데이터 기준) */
+function hasMotoForbidden(messages?: string[][]): boolean {
+  if (!messages || messages.length < 2) return false;
+  const tagIdx = messages[0].indexOf("WayTags");
+  if (tagIdx < 0) return false;
+  return messages.slice(1).some((row) => /highway=motorway|motorroad=yes/.test(row[tagIdx] ?? ""));
+}
+
 function cyclewayRatioFromMessages(messages?: string[][]): number | null {
   if (!messages || messages.length < 2) return null;
   const header = messages[0];
@@ -250,7 +259,9 @@ async function routeWithBRouter(
   alternative = 0,
   via: LatLng[] = [],
 ): Promise<Route> {
-  const brouterProfile = profile === "kakao" || profile === "battery" ? "safety" : profile;
+  // 오토바이: BRouter 기본 제공 moped 방식 (고속도로·자동차전용도로(motorroad)·자전거도로 제외)
+  const brouterProfile =
+    profile === "moto" ? "moped" : profile === "kakao" || profile === "battery" ? "safety" : profile;
   const params = new URLSearchParams({
     lonlats: [from, ...via, to].map((p) => `${p.lng},${p.lat}`).join("|"),
     profile: brouterProfile,
@@ -283,7 +294,11 @@ async function routeWithBRouter(
     coords,
     cum,
     distance: cum[cum.length - 1] ?? 0,
-    cyclewayRatio: cyclewayRatioFromMessages(feature.properties.messages),
+    cyclewayRatio: profile === "moto" ? null : cyclewayRatioFromMessages(feature.properties.messages),
+    note:
+      profile === "moto" && hasMotoForbidden(feature.properties.messages)
+        ? "경로에 이륜차 통행 금지 도로(고속도로·자동차전용도로)가 섞여 있을 수 있습니다. 표지판을 확인하세요."
+        : undefined,
     maneuvers,
     source: "brouter",
     profile,
@@ -466,6 +481,14 @@ export async function findBikeRoute(
   via: LatLng[] = [],
 ): Promise<Route> {
   if (haversine(from, to) < 20 && via.length === 0) throw new Error("출발지와 목적지가 너무 가깝습니다");
+  if (profile === "moto") {
+    // 자동차 경로로 대신 찾으면 이륜차가 못 가는 자동차전용도로가 섞이므로 대체 경로를 쓰지 않음
+    try {
+      return await routeWithBRouter(from, to, "moto", 0, via);
+    } catch (err) {
+      throw new Error(`오토바이 경로를 찾지 못했습니다 (${err instanceof Error ? err.message : String(err)})`);
+    }
+  }
   if (profile === "kakao") {
     try {
       return await routeWithKakaoVia(from, to, profile, via);
@@ -616,6 +639,8 @@ export const NEARBY_KINDS: NearbyKind[] = [
   { id: "SW8", icon: "🚇", label: "지하철역", category: "SW8" },
   { id: "PM9", icon: "💊", label: "약국", category: "PM9" },
   { id: "HP8", icon: "🏥", label: "병원", category: "HP8" },
+  { id: "OL7", icon: "⛽", label: "주유소", category: "OL7" },
+  { id: "moto-repair", icon: "🛠", label: "오토바이 센터", keyword: "오토바이 수리" },
 ];
 
 /** 주변 장소 (가까운 순). 카카오 키가 없으면 null */
