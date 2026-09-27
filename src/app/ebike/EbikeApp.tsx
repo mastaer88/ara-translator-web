@@ -105,8 +105,11 @@ import {
   type MaintItem,
 } from "@/lib/ebike/moto";
 import {
+  BUNDLED_CAMERAS_DATE,
   CameraWatcher,
   cameraPhrase,
+  fetchBundledCameras,
+  type CameraData,
   loadCameras,
   parseCameras,
   readTextFile,
@@ -346,7 +349,7 @@ export default function EbikeApp() {
   const [fuel, setFuel] = useState<FuelState>(loadFuel);
   const [dash, setDash] = useState<Dashboard>(loadDashboard);
   const [maint, setMaint] = useState<MaintItem[]>(loadMaint);
-  const [cameraData, setCameraData] = useState(loadCameras);
+  const [cameraData, setCameraData] = useState<CameraData>(loadCameras);
   const cameraWatcherRef = useRef<CameraWatcher | null>(null);
   useEffect(() => {
     cameraWatcherRef.current = cameraData.cameras.length
@@ -1482,9 +1485,14 @@ export default function EbikeApp() {
         toast.error("파일에서 카메라 위치를 찾지 못했습니다.");
         return;
       }
-      if (!saveCameras(cameras))
+      const data: CameraData = {
+        cameras,
+        importedAt: nowMs(),
+        source: "file",
+      };
+      if (!saveCameras(data))
         toast.warning("기기 저장 공간이 부족해 이번 실행 중에만 사용합니다.");
-      setCameraData({ cameras, importedAt: nowMs() });
+      setCameraData(data);
       toast.success(
         `단속 카메라 ${cameras.length.toLocaleString()}개를 불러왔습니다`,
       );
@@ -1494,6 +1502,42 @@ export default function EbikeApp() {
       );
     }
   };
+
+  /** 기본 제공 카메라 데이터 받기 (직접 불러온 파일이 없을 때, 더 새 데이터가 앱에 들어오면 다시) */
+  const loadBundledCameras = async (announce: boolean) => {
+    try {
+      const data = await fetchBundledCameras();
+      if (!saveCameras(data))
+        console.warn("카메라 데이터를 기기에 저장하지 못했습니다");
+      setCameraData(data);
+      if (announce)
+        toast.success(
+          `기본 단속 카메라 데이터 ${data.cameras.length.toLocaleString()}개 (${data.dataDate} 기준)`,
+        );
+    } catch (err) {
+      if (announce) toast.error("카메라 데이터를 받지 못했습니다.");
+      console.warn("카메라 데이터 받기 실패", err);
+    }
+  };
+  const needBundledCameras =
+    settings.vehicle === "moto" &&
+    settings.cameraWarn &&
+    cameraData.source !== "file" &&
+    cameraData.dataDate !== BUNDLED_CAMERAS_DATE;
+  useEffect(() => {
+    if (!needBundledCameras) return;
+    let cancelled = false;
+    fetchBundledCameras()
+      .then((data) => {
+        if (cancelled) return;
+        saveCameras(data);
+        setCameraData(data);
+      })
+      .catch((err) => console.warn("카메라 데이터 받기 실패", err));
+    return () => {
+      cancelled = true;
+    };
+  }, [needBundledCameras]);
 
   const changeProfile = (profile: RouteProfile) => {
     update("profile", profile);
@@ -2723,6 +2767,8 @@ export default function EbikeApp() {
           maintEnabled={settings.maintEnabled}
           cameraCount={cameraData.cameras.length}
           cameraImportedAt={cameraData.importedAt}
+          cameraSource={cameraData.source ?? null}
+          cameraDataDate={cameraData.dataDate ?? null}
           onFuel={(f, message) => {
             saveFuel(f);
             setFuel(f);
@@ -2738,10 +2784,7 @@ export default function EbikeApp() {
             setMaint(items);
           }}
           onImportCameras={importCameras}
-          onClearCameras={() => {
-            saveCameras([]);
-            setCameraData({ cameras: [], importedAt: null });
-          }}
+          onUseBundledCameras={() => loadBundledCameras(true)}
           onClose={() => setSheet(null)}
         />
       )}
