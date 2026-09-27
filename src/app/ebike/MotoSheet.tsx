@@ -22,11 +22,13 @@ type Props = {
   maintEnabled: boolean;
   cameraCount: number;
   cameraImportedAt: number | null;
+  cameraSource: "bundled" | "file" | null;
+  cameraDataDate: string | null;
   onFuel: (f: FuelState, message?: string) => void;
   onDash: (d: Dashboard) => void;
   onMaint: (items: MaintItem[]) => void;
   onImportCameras: (file: File) => void;
-  onClearCameras: () => void;
+  onUseBundledCameras: () => void;
   onClose: () => void;
 };
 
@@ -263,13 +265,15 @@ export default function MotoSheet(props: Props) {
         <Row label="저장된 카메라">
           <span className="font-mono">
             {props.cameraCount.toLocaleString()}개
-            {props.cameraImportedAt && (
-              <span className="ml-1 text-xs text-slate-400">
-                ({new Date(props.cameraImportedAt).toLocaleDateString("ko-KR")})
-              </span>
-            )}
           </span>
         </Row>
+        <p className="text-xs text-slate-400">
+          {props.cameraSource === "file"
+            ? `직접 불러온 파일${props.cameraImportedAt ? ` (${new Date(props.cameraImportedAt).toLocaleDateString("ko-KR")})` : ""}`
+            : props.cameraCount > 0
+              ? `앱 기본 데이터 · 전국무인교통단속카메라표준데이터 ${props.cameraDataDate ?? ""} 기준`
+              : "오토바이 모드에서 카메라 경고를 켜면 기본 데이터를 자동으로 받습니다."}
+        </p>
         <input
           ref={fileRef}
           type="file"
@@ -284,26 +288,22 @@ export default function MotoSheet(props: Props) {
         <div className="grid grid-cols-2 gap-2 text-sm">
           <button
             onClick={() => fileRef.current?.click()}
-            className="rounded-lg bg-blue-600 py-2 font-semibold"
+            className="rounded-lg bg-slate-700 py-2"
           >
-            파일 불러오기
+            새 파일 불러오기
           </button>
           <button
-            onClick={() =>
-              confirm("저장된 카메라 데이터를 지울까요?") &&
-              props.onClearCameras()
-            }
+            onClick={props.onUseBundledCameras}
             className="rounded-lg bg-slate-700 py-2"
-            disabled={props.cameraCount === 0}
           >
-            지우기
+            기본 데이터 다시 받기
           </button>
         </div>
         <p className="text-xs leading-relaxed text-slate-500">
-          공공데이터포털(data.go.kr)에서
-          &lsquo;전국무인교통단속카메라표준데이터&rsquo;를 검색해 CSV 파일을
-          받은 뒤 불러오세요. 한 번 불러오면 이 기기에 저장되고, 주행 중 앞쪽
-          카메라를 500m 전에 음성으로 알려드립니다.
+          주행 중 진행 방향 앞쪽 카메라를 500m 전에 음성으로 알려드립니다
+          (주정차 단속 카메라 제외, 구간 단속은 시작·끝 안내). 더 새 자료가
+          나오면 공공데이터포털(data.go.kr)에서
+          &lsquo;전국무인교통단속카메라표준데이터&rsquo; CSV를 받아 불러오세요.
         </p>
       </Section>
     </Sheet>
